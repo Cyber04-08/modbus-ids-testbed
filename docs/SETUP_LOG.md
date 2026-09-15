@@ -56,6 +56,46 @@ but the main server thread kept listening). Checked with
 Worth checking for stray listeners before assuming a "connection refused"
 means the server never started.
 
+## 2026-09-15 - GRFICSv2 networking prep
+
+Decided to also stand up GRFICSv2 (VirtualBox VMs) for the 3D process
+visualization and a real OpenPLC/HMI/firewall topology, alongside (not
+replacing) the Python simulator. Went with **v2 over v3**: v3 is Docker
+Compose-based and this machine has no Docker/WSL2 installed (would need a
+reboot to add); v2 works with VirtualBox, which is already installed.
+
+**Existing VirtualBox state found first:** two VMs already present -
+`kali-linux-2026.2-virtualbox-amd64` and `Metasploitable2` - both attached
+to `VirtualBox Host-Only Ethernet Adapter #2` (192.168.185.1/24), clearly
+an existing isolated attack-lab setup from other coursework. Left that
+adapter and both VMs untouched.
+
+**Created two new host-only adapters** for GRFICS instead of reusing/
+renumbering existing ones, matching the exact IPs the GRFICSv2 README
+specifies:
+
+```
+VBoxManage hostonlyif create                                   # -> "...Adapter #3"
+VBoxManage hostonlyif create                                   # -> "...Adapter #4"
+VBoxManage hostonlyif ipconfig "VirtualBox Host-Only Ethernet Adapter #3" \
+    --ip 192.168.90.111 --netmask 255.255.255.0                # DMZ
+VBoxManage hostonlyif ipconfig "VirtualBox Host-Only Ethernet Adapter #4" \
+    --ip 192.168.95.111 --netmask 255.255.255.0                # ICS
+```
+
+Result: Adapter #3 = DMZ (192.168.90.111/24), Adapter #4 = ICS
+(192.168.95.111/24) - matches GRFICSv2's `plc_2`/HMI/pfSense/workstation
+addressing scheme.
+
+**VM downloads:** the GRFICSv2 README's 5 VM links (Simulation, HMI,
+pfSense, PLC, Workstation) are SharePoint links that redirect to a sign-in
+page for automated tools (curl, WebFetch) - no Chrome extension connected
+in this environment to complete it via browser automation either. User is
+downloading manually into `C:\Users\nwane\Projects\GRFICSv2_VMs\`. Once
+files land: `VBoxManage import <file>.ova` for each, then attach each VM's
+NIC to the correct adapter per the IP table in the README, then boot in
+order (ICS subnet + pfSense first, then ScadaBR/HMI).
+
 ## Next steps (Phase 1 remainder / Phase 2 start)
 
 - [ ] Validate the rule-based detector's invariant list against what the
