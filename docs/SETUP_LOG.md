@@ -144,13 +144,78 @@ This matches the README's IP table (pfSense bridges DMZ↔ICS as the only
 dual-homed VM; everything else is single-homed on whichever side its IP
 puts it on).
 
+**Booted all 5 in the required order** (ICS subnet + pfSense first, then
+ScadaBR) via `VBoxManage startvm`. All came up clean - no errors on any
+console (verified via `VBoxManage controlvm <vm> screenshotpng`, since
+there's no Chrome extension connected in this environment to view the VM
+windows directly).
+
+**Guest Additions aren't installed/running** on these appliances -
+`VBoxManage guestcontrol` failed with "guest execution service is not
+ready". Logged into `plc_2` and `ChemicalPlant` via
+`VBoxManage controlvm <vm> keyboardputstring "<text>"` +
+`keyboardputscancode 1c 9c` (Enter) instead, to check whether the
+simulation/PLC processes were already running before attempting to start
+them manually - they were:
+
+- **plc_2:** `sudo nodejs server.js` auto-starts on boot (found via
+  `ps aux`: root-owned `nodejs server.js` already running since boot).
+  Manually re-running it correctly failed with `EADDRINUSE :::8080`,
+  confirming the real one was already up. No action needed.
+- **ChemicalPlant:** the `simulation` binary and all 6 Modbus remote_io
+  scripts (`tank.py`, `feed1.py`, `feed2.py`, `purge.py`, `product.py`,
+  `analyzer.py`) are likewise already running since boot. No action
+  needed.
+
+**End-to-end verification from the host:**
+
+```
+ping 192.168.95.2        # plc_2 (ICS)          -> reply, TTL=64
+ping 192.168.90.5        # ScadaBR (DMZ)        -> reply, TTL=64
+curl -I http://192.168.90.5:8080/ScadaBR/       -> HTTP/1.1 200 OK
+python -c "socket connect to 192.168.95.2:502"  -> Modbus/TCP port OPEN
+```
+
+pfSense's own console confirms the same addressing independently (WAN
+192.168.90.100/24, LAN 192.168.95.1/24), so the network wiring is correct
+end to end, not just "looks right in `showvminfo`."
+
+**Result: the full GRFICSv2 testbed is live** - real OpenPLC on plc_2,
+real 3D chemical-process simulation on ChemicalPlant feeding it live
+Modbus/TCP traffic, real ScadaBR HMI, real pfSense routing between DMZ and
+ICS. This runs *alongside* (not replacing) the Python simulator from
+Phase 1 - GRFICS is the higher-fidelity option when it's wanted (3D
+visualization, real ladder-logic PLC, real firewall segmentation); the
+Python simulator remains the faster/lighter option for iterating on
+detector code.
+
+**VM console credentials** (from the README, for reference):
+
+| VM | Login | Password |
+|---|---|---|
+| plc_2 | user | password |
+| ChemicalPlant | simulation | Fortiphyd |
+| ScadaBR (console/SSH) | scadabr | scadabr |
+| ScadaBR (web, admin) | admin | admin |
+| pfSense (console) | admin | pfsense |
+| workstation | workstation | password |
+
+ScadaBR web UI: http://192.168.90.5:8080/ScadaBR (reachable from the host
+directly, since the host sits on both host-only networks).
+
 ## Next steps (Phase 1 remainder / Phase 2 start)
 
 - [ ] Validate the rule-based detector's invariant list against what the
       Wiley paper (Rajesh & Satyanarayana, 2021) actually checks before
       finalizing it (see `docs/PREWORK_NOTES.md`).
-- [ ] Capture a baseline "normal" traffic window from the simulator with
-      varying setpoints to build the normal-traffic dataset.
-- [ ] Decide whether to also stand up OpenPLC (native ladder-logic PLC) in
-      parallel for a more authentic PLC, or keep the Python simulator as the
-      system of record and treat OpenPLC/GRFICS as a stretch goal.
+- [ ] Capture a baseline "normal" traffic window - from the Python
+      simulator (with varying setpoints) and/or from GRFICS's live Modbus
+      traffic on plc_2/ChemicalPlant - to build the normal-traffic
+      dataset.
+- [ ] Decide which testbed is the system of record for Phase 2/3 (attack
+      scripts, detectors): the Python simulator (fast iteration) or
+      GRFICS (higher fidelity, but slower to reset/re-run against). Could
+      also do both and note the difference in the report.
+- [ ] Log into ScadaBR's web UI (admin/admin) and confirm it's actually
+      showing live tank/process data from ChemicalPlant, not just that the
+      login page loads.
