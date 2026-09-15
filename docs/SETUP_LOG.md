@@ -96,6 +96,54 @@ files land: `VBoxManage import <file>.ova` for each, then attach each VM's
 NIC to the correct adapter per the IP table in the README, then boot in
 order (ICS subnet + pfSense first, then ScadaBR/HMI).
 
+**Note:** partway through this session, the whole `Projects` folder
+(including `GRFICSv2_VMs`) was moved from `C:\Users\nwane\Projects` to
+`C:\Users\nwane\OneDrive\Desktop\SENIOR SEMINAR I\Projects`, for the
+deliverable folder to be self-contained. Confirmed safe: git uses relative
+paths internally and the GitHub remote is a URL, so the repo wasn't
+affected; VirtualBox's actual VM files live in the separate, non-synced
+`C:\Users\nwane\VirtualBox VMs`, so no OneDrive-vs-running-VM write
+conflicts either. All paths below reflect the new location.
+
+## 2026-09-15 - GRFICSv2 VMs imported and networked
+
+All 5 `.ova` files downloaded (~6.4GB total: ChemicalPlant 1.3GB, ScadaBR
+0.7GB, pfSense 0.6GB, plc_2 1.2GB, workstation 2.9GB) and imported with
+`VBoxManage import`. Host has plenty of headroom (32GB RAM total, ~19GB
+free vs. ~4GB combined configured for all 5 VMs).
+
+**Import did not reliably preserve network mappings** - some VMs' NICs
+ended up pointing at a host-only adapter name (`...Adapter #5`) that
+doesn't actually exist on this host (the OVA's embedded network reference
+didn't match anything real, so VirtualBox left a dangling reference rather
+than erroring). Fixed by explicitly setting every VM's host-only adapter
+with `VBoxManage modifyvm`, rather than trusting the import's guess:
+
+```
+VBoxManage modifyvm plc_2 --nic1 hostonly --hostonlyadapter1 "VirtualBox Host-Only Ethernet Adapter #4"
+VBoxManage modifyvm ChemicalPlant --nic2 hostonly --hostonlyadapter2 "VirtualBox Host-Only Ethernet Adapter #4"
+VBoxManage modifyvm pfSense --nic1 hostonly --hostonlyadapter1 "VirtualBox Host-Only Ethernet Adapter #3" --nic2 hostonly --hostonlyadapter2 "VirtualBox Host-Only Ethernet Adapter #4"
+VBoxManage modifyvm ScadaBR --nic1 hostonly --hostonlyadapter1 "VirtualBox Host-Only Ethernet Adapter #3"
+VBoxManage modifyvm workstation --nic1 hostonly --hostonlyadapter1 "VirtualBox Host-Only Ethernet Adapter #4"
+```
+
+Note `ChemicalPlant`'s active NIC is slot 2, not 1 (NIC 1 comes disabled
+from the OVA) - don't assume slot 1 for every VM, check `showvminfo` first.
+
+Final mapping (verified via `showvminfo | grep NIC`):
+
+| VM | NIC(s) | Network |
+|---|---|---|
+| plc_2 | NIC1 | ICS (Adapter #4, 192.168.95.111/24) |
+| ChemicalPlant | NIC2 | ICS (Adapter #4) |
+| pfSense | NIC1 / NIC2 | DMZ (Adapter #3) / ICS (Adapter #4) |
+| ScadaBR | NIC1 | DMZ (Adapter #3) |
+| workstation | NIC1 | ICS (Adapter #4) |
+
+This matches the README's IP table (pfSense bridges DMZ↔ICS as the only
+dual-homed VM; everything else is single-homed on whichever side its IP
+puts it on).
+
 ## Next steps (Phase 1 remainder / Phase 2 start)
 
 - [ ] Validate the rule-based detector's invariant list against what the
