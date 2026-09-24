@@ -6,3 +6,6 @@ venv/
 data/*.pcap
 data/*.csv
 !data/.gitkeep
+# Generated capture artifacts (regenerate via attacks/run_scenario.py)
+data/*.json
+data/.hmi_port
