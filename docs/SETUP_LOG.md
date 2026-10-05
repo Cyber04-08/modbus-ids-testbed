@@ -384,7 +384,7 @@ Isolation Forest is re-seeded per run so its own randomness is part of the
 spread (small change: `MLAnomalyDetector` and `eval_ml` now accept a
 `random_state`).
 
-Run: `python detectors/multi_run.py 10` -> 10 independent captures, 731 request
+Run: `python detectors/multi_run.py 10` -> 10 independent captures, 734 request
 frames in total, 150 of them malicious (15 per run). Each run's labeled set is
 kept in `data/runs/run_XX.csv`; `--reuse` re-scores them without re-capturing.
 
