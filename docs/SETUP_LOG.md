@@ -406,3 +406,53 @@ alarms: over 10 runs its false-positive rate is ~23% (range 14-28%), not ~15%,
 while its recall is slightly higher (0.80-0.87). Its per-request cost is ~260x
 the rule-based detector's. Tuning the ML false-alarm rate is therefore the
 first item for the second half of the semester.
+
+## 2026-10-05 - Evaluation-protocol fixes from instructor feedback
+
+Instructor feedback on Assignments 01 and 02 asked for (1) training, tuning
+and testing separated by capture session, (2) attack labels from script logs
+and packet identifiers rather than injection timestamps, (3) malicious
+requests distinguished from legitimate responses, (4) the overhead claim
+narrowed to detector processing cost (or control-cycle delay measured), and
+(5) a definition of normal traffic. All are written up in
+`docs/EVALUATION_PROTOCOL.md`. Code changes:
+
+- `attacks/modbus_frames.py` `log_packet()`; both attack scripts now log every
+  request they send (`PACKET=<json>`: exact bytes, txid, kind). The replay's
+  first send is logged as kind `seed` (its stand-in for the recorded operator
+  command, not itself a replay). `attacks/run_scenario.py` stores the records
+  in the manifest.
+- `data/label_dataset.py` matches each attack-connection request to its logged
+  record by exact bytes, in order (15/15 per session), keeps the time window
+  as a cross-check, labels PLC replies `response` and the seed `replay_seed`;
+  both are left unscored (blank `is_attack`).
+- `detectors/features.py` adds a `scored` column; `evaluate.py`,
+  `multi_run.py` and the detectors' standalone modes grade scored requests
+  only. Detectors still see the whole request stream.
+- `attacks/capture_tuning.py` captures a separate tuning session
+  (`data/tuning_labeled.csv`); the ML contamination comes from it (0.177),
+  never from a test session.
+- The overhead claim is narrowed to detector processing cost: the detectors
+  read a recorded copy and are not in the control path.
+
+Previous 10 runs kept in `data/v1_before_feedback/`. Re-run with the fixes:
+`python detectors/multi_run.py 10` -> 750 scored requests, 140 attacks (14 per
+run).
+
+| metric (mean +/- 95% CI half-width) | rule-based | ML (iForest) |
+|---|---|---|
+| precision | 1.000 +/- 0.000 | 0.531 +/- 0.053 |
+| recall | 0.714 +/- 0.000 | 0.871 +/- 0.022 |
+| F1 | 0.833 +/- 0.000 | 0.657 +/- 0.037 |
+| false-positive rate | 0.000 +/- 0.000 | 0.182 +/- 0.032 (range 0.09-0.27) |
+| injection detection latency | 1.503 s | 0.501 s |
+| detector processing cost | 0.0035 ms/request, 3 KB | 0.80 ms/request, 755 KB |
+
+What changed and why: rule-based recall 0.667 -> 0.714 because the replay
+seed, which no detector should flag, is no longer scored as a miss (rule
+results are otherwise identical: TP10 FP0, now FN4). ML: recall up from the
+seed exclusion, but the leak-free contamination (0.177) is lower than the
+test fractions the old method used (0.17-0.20), so ML flags slightly less:
+FPR 0.227 -> 0.182, precision 0.496 -> 0.531. Scoring the same new data with
+the old leaky setting gives P 0.507 / R 0.900 / FPR 0.203 - the leak flattered
+ML recall a little. The accuracy-versus-cost trade-off is unchanged.

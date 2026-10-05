@@ -14,9 +14,16 @@ Each run:
     4. score it with both detectors (evaluate.py's functions), the Isolation
        Forest re-seeded per run so its randomness is part of the spread
 
-The ML training set (data/baseline_capture.csv) is captured once and reused
-for every run, mirroring deployment: train once on normal traffic, then face
-many unseen traffic windows.
+Three kinds of independent capture session, never mixed:
+    train - data/baseline_capture.csv (normal only), captured once; the ML
+            model fits on it, mirroring deployment (train once, then face many
+            unseen traffic windows)
+    tune  - data/tuning_labeled.csv, its own labeled scenario session (made by
+            attacks/capture_tuning.py if missing); the ML contamination is set
+            from it, never from a test run
+    test  - one fresh scenario session per run, used only for scoring
+Only scored requests are graded (PLC responses and the replay's seed packet
+stay in the stream the detectors see but are not graded).
 
 Outputs:
     data/runs/run_XX.csv            - each run's labeled test set
@@ -41,8 +48,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from evaluate import (detection_latency, eval_ml, eval_rule_based,  # noqa: E402
-                      quality_metrics)
+from evaluate import (contamination_from, detection_latency, eval_ml,  # noqa: E402
+                      eval_rule_based, quality_metrics, scored_mask)
 from features import load_requests                                 # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +57,7 @@ PY = sys.executable
 DATA_DIR = ROOT / "data"
 RUNS_DIR = DATA_DIR / "runs"
 TRAIN_CSV = DATA_DIR / "baseline_capture.csv"
+TUNE_CSV = DATA_DIR / "tuning_labeled.csv"
 RESULTS_CSV = DATA_DIR / "multi_run_results.csv"
 SUMMARY_CSV = DATA_DIR / "multi_run_summary.csv"
 
@@ -80,21 +88,21 @@ def capture_run(i: int, quick: bool) -> Path:
     return out
 
 
-def score_run(train_df, test_csv: Path, seed: int) -> list[dict]:
+def score_run(train_df, test_csv: Path, seed: int, contamination: float) -> list[dict]:
     test_df = load_requests(str(test_csv))
-    y = test_df["is_attack"].to_numpy()
-    contamination = min(max(float(y.mean()), 0.01), 0.5)
+    mask = scored_mask(test_df)
+    y = test_df["is_attack"].to_numpy()[mask]
 
     rows = []
     for name, (pred, cost) in (
         ("rule-based", eval_rule_based(train_df, test_df)),
         ("ml-iforest", eval_ml(train_df, test_df, contamination, random_state=seed)),
     ):
-        q = quality_metrics(y, pred)
+        q = quality_metrics(y, pred[mask])
         lat = detection_latency(test_df, pred)
         rows.append({
             "run": test_csv.stem, "detector": name,
-            "n_requests": len(test_df), "n_attack": int(y.sum()),
+            "n_requests": len(y), "n_attack": int(y.sum()),
             **{k: q[k] for k in ("TP", "FP", "FN", "TN", "precision",
                                  "recall", "f1", "fpr", "accuracy")},
             # A missed attack has no latency; left blank and counted separately.
@@ -147,6 +155,11 @@ def main() -> None:
         raise SystemExit(f"Missing {TRAIN_CSV}; run: python testbed/capture_baseline.py")
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     train_df = load_requests(str(TRAIN_CSV))
+    if not TUNE_CSV.exists():
+        print("[multi-run] no tuning session yet - capturing one...", flush=True)
+        subprocess.run([PY, str(ROOT / "attacks" / "capture_tuning.py")], check=True,
+                       cwd=ROOT, stdout=subprocess.DEVNULL)
+    contamination = contamination_from(load_requests(str(TUNE_CSV)))
 
     if reuse:
         run_files = sorted(RUNS_DIR.glob("run_*.csv"))
@@ -160,13 +173,14 @@ def main() -> None:
 
     results = []
     for seed, f in enumerate(run_files):
-        results.extend(score_run(train_df, f, seed))
+        results.extend(score_run(train_df, f, seed, contamination))
     write_csv(RESULTS_CSV, results)
     summary = summarize(results)
     write_csv(SUMMARY_CSV, summary)
 
     print(f"\nModbus/TCP IDS - {len(run_files)}-run comparison "
-          f"(train: {len(train_df)} benign requests)")
+          f"(train: {len(train_df)} benign requests; ML contamination "
+          f"{contamination:.3f} from the tuning session)")
     print(f"{'metric':<22}{'rule-based':>26}{'ML (iForest)':>26}")
     print("-" * 74)
     by = {(s["detector"], s["metric"]): s for s in summary}

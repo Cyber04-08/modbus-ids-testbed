@@ -79,7 +79,9 @@ def main() -> None:
     print(f"  scored {len(test_df)} requests from {test_csv}; "
           f"anomalies flagged: {int(preds.sum())}")
     if "is_attack" in test_df.columns:
-        y = test_df["is_attack"].to_numpy()
+        # Grade scored requests only (responses / replay seed are not graded).
+        keep = test_df["scored"].to_numpy() if "scored" in test_df.columns else slice(None)
+        y, preds = test_df["is_attack"].to_numpy()[keep], preds[keep]
         tp = int(((preds == 1) & (y == 1)).sum())
         fp = int(((preds == 1) & (y == 0)).sum())
         fn = int(((preds == 0) & (y == 1)).sum())

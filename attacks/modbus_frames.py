@@ -70,3 +70,18 @@ def read_holding(transaction_id: int, address: int, count: int,
 
 def parse_transaction_id(frame: bytes) -> int:
     return struct.unpack(">H", frame[0:2])[0]
+
+
+def log_packet(frame: bytes, kind: str, describe: str = "") -> None:
+    """Print one per-packet ground-truth record on stdout for the orchestrator.
+
+    kind is "attack" for a malicious request, or "seed" for the replay's
+    stand-in for the recorded operator command (not itself a replay). The
+    labeler matches each captured request against these records by exact
+    bytes, so labels are per packet rather than inferred from time windows.
+    """
+    import json
+    import time
+    print("PACKET=" + json.dumps({
+        "kind": kind, "txid": parse_transaction_id(frame), "raw_hex": frame.hex(),
+        "sent_at": time.time(), "describe": describe}), flush=True)

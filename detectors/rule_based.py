@@ -144,6 +144,9 @@ def main() -> None:
     for rule, c in sorted(fired.items(), key=lambda kv: -kv[1]):
         print(f"    {rule:28s}: {c}")
     if "is_attack" in df.columns:
+        # Grade scored requests only (responses / replay seed are not graded).
+        if "scored" in df.columns:
+            df = df[df.scored]
         tp = int(((df.pred == 1) & (df.is_attack == 1)).sum())
         fp = int(((df.pred == 1) & (df.is_attack == 0)).sum())
         fn = int(((df.pred == 0) & (df.is_attack == 1)).sum())

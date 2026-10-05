@@ -9,3 +9,5 @@ data/*.csv
 # Generated capture artifacts (regenerate via attacks/run_scenario.py)
 data/*.json
 data/.hmi_port
+data/runs/
+data/v1_before_feedback/

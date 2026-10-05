@@ -63,18 +63,23 @@ python data/label_dataset.py              # -> data/labeled.csv (benign/replay/i
   `data/attack_manifest.json` (ground truth).
 - `data/label_dataset.py` - merges capture + manifest into `data/labeled.csv`.
 
-Ground truth is by source port (each client reports its ephemeral port to the
-orchestrator) and cross-checked against each attack's recorded time window.
-On this single-host loopback testbed every client shares IP 127.0.0.1, so
-they are told apart by source port; GRFICSv2 provides true per-host IP
-separation when higher fidelity is wanted.
+Ground truth is per packet: each attack script logs every request it sends
+(exact bytes, transaction ID), and the labeler matches each captured request
+on that attack's connection (identified by its reported source port) to its
+log record, with the attack's time window as a cross-check. PLC responses are
+labeled `response` and the replay's seed packet `replay_seed`; neither is
+scored. Normal traffic, labels and the train/tune/test sessions are defined in
+`docs/EVALUATION_PROTOCOL.md`. On this single-host loopback testbed every
+client shares IP 127.0.0.1, so they are told apart by source port; GRFICSv2
+provides true per-host IP separation when higher fidelity is wanted.
 
 ## Detectors and evaluation (Phases 3-4)
 
 ```
 pip install numpy pandas scikit-learn
-python testbed/capture_baseline.py            # -> data/baseline_capture.csv (normal only, for ML training)
-python attacks/run_scenario.py && python data/label_dataset.py   # -> data/labeled.csv (mixed, test set)
+python testbed/capture_baseline.py            # train session -> data/baseline_capture.csv (normal only)
+python attacks/capture_tuning.py              # tune session  -> data/tuning_labeled.csv
+python attacks/run_scenario.py && python data/label_dataset.py   # test session -> data/labeled.csv
 python detectors/evaluate.py                  # head-to-head comparison
 python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
 ```
@@ -88,18 +93,21 @@ python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
   which uses fresh incrementing IDs, is not flagged).
 - `detectors/ml_anomaly.py` - Isolation Forest trained on normal traffic only;
   features are function code, register address/value, request size, and
-  per-connection inter-arrival time; `contamination` is set to the observed
-  attack fraction, not left at default.
+  per-connection inter-arrival time; `contamination` is set to the attack
+  fraction of the separate tuning session, not left at default and never
+  taken from the test set.
 - `detectors/evaluate.py` - runs both over the same test set and reports
-  precision/recall/F1/FPR, mean detection latency, and per-request processing
-  time + peak memory.
+  precision/recall/F1/FPR, mean detection latency, and detector processing
+  cost (per-request time + peak memory). The detectors read a recorded copy
+  of the traffic and are not in the control path, so this is the monitoring
+  host's cost, not a control-loop delay.
 
-Result over 10 independent runs (731 requests, 150 attacks; mean +/- 95% CI):
-the rule-based detector reaches precision 1.00 with a 0 false-positive rate at
-~0.0035 ms and ~2 KB, but misses *well-formed* malicious commands (recall
-0.67, identical every run); the Isolation Forest reaches higher recall
-(0.85 +/- 0.02) and lower injection-detection latency (0.50 s vs 1.50 s), but at
-a 0.23 +/- 0.03 false-positive rate and ~260x the processing time (0.92 ms) and
-~750 KB of memory. That
-accuracy-versus-operational-cost trade-off, measured head-to-head on unmodified
-Modbus/TCP, is the project's contribution.
+Result over 10 independent test sessions (750 scored requests, 140 attacks;
+mean +/- 95% CI): the rule-based detector reaches precision 1.00 with a 0
+false-positive rate at ~0.0035 ms and ~3 KB per request, but misses
+*well-formed* malicious commands (recall 0.71, identical every run); the
+Isolation Forest reaches higher recall (0.87 +/- 0.02) and lower
+injection-detection latency (0.50 s vs 1.50 s), but at a 0.18 +/- 0.03
+false-positive rate and roughly 200x the processing cost (0.80 ms) and ~750 KB
+of memory. That accuracy-versus-processing-cost trade-off, measured
+head-to-head on unmodified Modbus/TCP, is the project's contribution.

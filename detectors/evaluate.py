@@ -13,13 +13,24 @@ test traffic and reports, for each, exactly the metrics the proposal commits to:
     "can this run next to real equipment?" numbers that neither prior work
     reports for a head-to-head.
 
-Datasets (kept separate to avoid train/test leakage):
-  * train = data/baseline_capture.csv  (normal only; ML trains on this)
-  * test  = data/labeled.csv           (benign + replay + injection)
+Three independent capture sessions, never mixed (no train/tune/test leakage):
+  * train = data/baseline_capture.csv  (normal only; the ML model fits on this)
+  * tune  = data/tuning_labeled.csv    (its own labeled scenario session; the
+                                        ML contamination is set from it)
+  * test  = data/labeled.csv           (benign + replay + injection; used only
+                                        for final scoring, its labels are never
+                                        used to configure a detector)
+
+Only scored requests are graded: PLC responses and the replay's seed packet
+are kept in the stream the detectors see but are left out of the metrics.
+
+Cost is the detector's own processing cost on the monitoring host. The
+detectors read a copy of the traffic and are not in the control path, so they
+add no delay to the PLC/HMI control cycle by construction.
 
 Usage:
     python detectors/evaluate.py
-    python detectors/evaluate.py <train_csv> <test_csv>
+    python detectors/evaluate.py <train_csv> <test_csv> [<tune_csv>]
 """
 
 from __future__ import annotations
@@ -72,8 +83,19 @@ def detection_latency(df, y_pred: np.ndarray) -> dict:
     return out
 
 
+def scored_mask(df) -> np.ndarray:
+    return df["scored"].to_numpy() if "scored" in df.columns else np.ones(len(df), bool)
+
+
+def contamination_from(tune_df) -> float:
+    """ML contamination = attack fraction of the scored requests in the
+    separate tuning session (the proposal's "tuned to the expected imbalance"),
+    clamped to the range IsolationForest accepts."""
+    y = tune_df["is_attack"].to_numpy()[scored_mask(tune_df)]
+    return min(max(float(y.mean()), 0.01), 0.5)
+
+
 def eval_rule_based(train_df, test_df):
-    y = test_df["is_attack"].to_numpy()
     det = RuleBasedDetector()  # config-driven; no training needed
     rows = list(test_df.itertuples(index=False))
 
@@ -128,36 +150,36 @@ def print_report(name, q, cost, latency):
 def main() -> None:
     train_csv = sys.argv[1] if len(sys.argv) > 1 else "data/baseline_capture.csv"
     test_csv = sys.argv[2] if len(sys.argv) > 2 else "data/labeled.csv"
+    tune_csv = sys.argv[3] if len(sys.argv) > 3 else "data/tuning_labeled.csv"
 
-    for pth in (train_csv, test_csv):
+    for pth in (train_csv, test_csv, tune_csv):
         if not Path(pth).exists():
             raise SystemExit(
-                f"Missing {pth}. Generate datasets first:\n"
-                "  python testbed/capture_baseline.py     # -> data/baseline_capture.csv\n"
-                "  python attacks/run_scenario.py && python data/label_dataset.py")
+                f"Missing {pth}. Generate the three sessions first:\n"
+                "  python testbed/capture_baseline.py     # train -> data/baseline_capture.csv\n"
+                "  python attacks/capture_tuning.py       # tune  -> data/tuning_labeled.csv\n"
+                "  python attacks/run_scenario.py && python data/label_dataset.py   # test")
 
     train_df = load_requests(train_csv)
+    tune_df = load_requests(tune_csv)
     test_df = load_requests(test_csv)
-    y = test_df["is_attack"].to_numpy()
-
-    # Set ML contamination to the actual attack fraction in the test set - the
-    # proposal's "tuned to reflect the expected imbalance" rather than default.
-    attack_fraction = float(y.mean())
-    contamination = min(max(attack_fraction, 0.01), 0.5)
+    mask = scored_mask(test_df)
+    y = test_df["is_attack"].to_numpy()[mask]
+    contamination = contamination_from(tune_df)
 
     print("Modbus/TCP IDS - detector comparison")
     print(f"  train (normal only): {len(train_df)} requests  <- {train_csv}")
-    print(f"  test  (mixed):       {len(test_df)} requests "
+    print(f"  tune  (own session): ML contamination = {contamination:.3f}  <- {tune_csv}")
+    print(f"  test  (scored):      {len(y)} requests "
           f"({int(y.sum())} attack / {int((y == 0).sum())} benign)  <- {test_csv}")
-    print(f"  ML contamination set to observed attack fraction: {contamination:.3f}")
 
     rb_pred, rb_cost = eval_rule_based(train_df, test_df)
-    rb_q = quality_metrics(y, rb_pred)
+    rb_q = quality_metrics(y, rb_pred[mask])
     rb_lat = detection_latency(test_df, rb_pred)
     print_report("Rule-based detector", rb_q, rb_cost, rb_lat)
 
     ml_pred, ml_cost = eval_ml(train_df, test_df, contamination)
-    ml_q = quality_metrics(y, ml_pred)
+    ml_q = quality_metrics(y, ml_pred[mask])
     ml_lat = detection_latency(test_df, ml_pred)
     print_report("ML anomaly detector (Isolation Forest)", ml_q, ml_cost, ml_lat)
 

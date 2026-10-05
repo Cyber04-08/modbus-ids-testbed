@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from modbus_frames import (  # noqa: E402
-    write_single_register, write_single_coil, write_multiple_registers,
+    log_packet, write_single_register, write_single_coil, write_multiple_registers,
 )
 
 TAP_HOST = "127.0.0.1"
@@ -51,6 +51,7 @@ def connect() -> socket.socket:
 
 
 def send(sock: socket.socket, frame: bytes, describe: str) -> None:
+    log_packet(frame, "attack", describe)
     sock.sendall(frame)
     try:
         sock.recv(256)

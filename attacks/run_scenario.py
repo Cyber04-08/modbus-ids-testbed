@@ -16,11 +16,15 @@ Sequence:
     8. [baseline] tail of normal traffic
     9. tear everything down, write data/attack_manifest.json
 
-Ground truth is assigned two independent ways (belt and suspenders):
-  * by source port - each client uses an ephemeral port and reports it back,
-    and this script records which port belongs to which role; and
-  * by wall-clock attack window - recorded here.
-The labeler uses the source port as primary truth and the windows as a check.
+Ground truth comes from the attack scripts' own logs, per packet:
+  * each client uses an ephemeral source port and reports it back, so this
+    script records which connection belongs to which role;
+  * each attack script logs every request it sends (exact bytes, transaction
+    ID, and kind: "attack", or "seed" for the replay's stand-in for the
+    recorded operator command), collected into the manifest; and
+  * the wall-clock window of each attack is recorded as a cross-check.
+The labeler matches every captured request on an attack connection to its
+logged record and checks it falls inside the window.
 
 Usage:
     python attacks/run_scenario.py                 # default timing
@@ -58,18 +62,23 @@ def wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 
-def run_attack(script: str, label: str) -> tuple[float, float, int]:
+def run_attack(script: str, label: str) -> tuple[float, float, int, list]:
     """Run an attack script, echo its output, and return
-    (window_start, window_end, source_port). The script prints
-    `SOURCE_PORT=<n>` so we can attribute its captured frames as ground truth."""
+    (window_start, window_end, source_port, packets). The script prints
+    `SOURCE_PORT=<n>` so we can attribute its connection, and one
+    `PACKET=<json>` line per request it sends (exact bytes, transaction ID,
+    and kind "attack"/"seed") so every packet is labeled individually."""
     start = time.time()
     proc = subprocess.run([PY, str(ROOT / "attacks" / script)],
                           capture_output=True, text=True)
     end = time.time()
     source_port = -1
+    packets = []
     for line in proc.stdout.splitlines():
         if line.startswith("SOURCE_PORT="):
             source_port = int(line.split("=", 1)[1])
+        elif line.startswith("PACKET="):
+            packets.append(json.loads(line.split("=", 1)[1]))
         else:
             print(line)
     if proc.stderr.strip():
@@ -77,7 +86,7 @@ def run_attack(script: str, label: str) -> tuple[float, float, int]:
     if source_port == -1:
         print(f"[scenario] WARNING: {script} did not report a source port - "
               "its frames cannot be labeled.")
-    return start, end, source_port
+    return start, end, source_port, packets
 
 
 def main() -> None:
@@ -127,9 +136,9 @@ def main() -> None:
 
         # 5. replay attack
         print("[scenario] injecting REPLAY attack...")
-        r_start, r_end, r_port = run_attack("replay_attack.py", "replay")
+        r_start, r_end, r_port, r_packets = run_attack("replay_attack.py", "replay")
         windows.append({"type": "replay", "start": r_start, "end": r_end,
-                        "source_port": r_port})
+                        "source_port": r_port, "packets": r_packets})
 
         # 6. gap
         print(f"[scenario] baseline gap for {gap}s...")
@@ -137,9 +146,9 @@ def main() -> None:
 
         # 7. injection attack
         print("[scenario] injecting COMMAND-INJECTION attack...")
-        i_start, i_end, i_port = run_attack("command_injection.py", "injection")
+        i_start, i_end, i_port, i_packets = run_attack("command_injection.py", "injection")
         windows.append({"type": "injection", "start": i_start, "end": i_end,
-                        "source_port": i_port})
+                        "source_port": i_port, "packets": i_packets})
 
         # 8. tail
         print(f"[scenario] baseline tail for {post}s...")
@@ -164,9 +173,11 @@ def main() -> None:
             "source_port_roles": source_port_roles,
             "attack_windows": windows,
             "notes": (
-                "Ground truth: label each captured frame by its client_port via "
-                "source_port_roles (primary); attack_windows give the wall-clock "
-                "span of each attack as an independent cross-check. Single-host "
+                "Ground truth: each attack window lists every request the attack "
+                "script sent (exact bytes, txid, kind attack/seed), logged by the "
+                "script itself. The labeler matches captured requests on that "
+                "connection (client_port, via source_port_roles) to these records "
+                "one by one; the wall-clock window is a cross-check. Single-host "
                 "loopback testbed, so all frames share IP 127.0.0.1 and are "
                 "distinguished by source port - GRFICSv2 provides true per-host "
                 "IP separation when higher fidelity is wanted."

@@ -58,7 +58,12 @@ def load_requests(csv_path: str) -> pd.DataFrame:
     )
 
     if "is_attack" in df.columns:
-        df["is_attack"] = pd.to_numeric(df["is_attack"], errors="coerce").fillna(0).astype(int)
+        # A blank is_attack marks a request the detectors still see (it is part
+        # of the traffic stream, e.g. the replay's seed packet) but that is
+        # not graded. `scored` keeps that distinction once blanks become 0.
+        is_attack = pd.to_numeric(df["is_attack"], errors="coerce")
+        df["scored"] = is_attack.notna()
+        df["is_attack"] = is_attack.fillna(0).astype(int)
 
     return df
 
