@@ -371,3 +371,38 @@ head-to-head on unmodified Modbus/TCP.
   That's realistic for a rule-based ICS detector but means it doesn't
   generalize to an unknown process without re-specification - a point in the
   ML detector's favour worth stating.
+
+## 2026-10-04 - Multi-run statistical evaluation (10 runs)
+
+Addressed the "small dataset" limitation above: `detectors/multi_run.py`
+repeats the whole pipeline (fresh scenario capture -> labeling -> both
+detectors) N times and reports each metric as mean, standard deviation and a
+95% Student-t confidence interval, plus a pooled (micro-averaged) confusion
+matrix. The ML training set (`data/baseline_capture.csv`) is captured once and
+reused, mirroring deployment (train once, face many unseen windows); the
+Isolation Forest is re-seeded per run so its own randomness is part of the
+spread (small change: `MLAnomalyDetector` and `eval_ml` now accept a
+`random_state`).
+
+Run: `python detectors/multi_run.py 10` -> 10 independent captures, 731 request
+frames in total, 150 of them malicious (15 per run). Each run's labeled set is
+kept in `data/runs/run_XX.csv`; `--reuse` re-scores them without re-capturing.
+
+| metric (mean +/- 95% CI half-width) | rule-based | ML (iForest) |
+|---|---|---|
+| precision | 1.000 +/- 0.000 | 0.496 +/- 0.041 |
+| recall | 0.667 +/- 0.000 | 0.853 +/- 0.020 |
+| F1 | 0.800 +/- 0.000 | 0.625 +/- 0.034 |
+| false-positive rate | 0.000 +/- 0.000 | 0.227 +/- 0.031 |
+| replay detection latency | 0.001 s | 0.081 +/- 0.121 s |
+| injection detection latency | 1.504 s | 0.501 s |
+| ms/request | 0.0035 +/- 0.0006 | 0.921 +/- 0.054 |
+| peak memory | 2 KB | 756 +/- 14 KB |
+
+**What changed versus the single run:** the trade-off is confirmed, and the
+rule-based detector is fully deterministic (identical TP10/FP0/FN5 in every
+run). The single run in Progress Report 2 *understated* the ML detector's false
+alarms: over 10 runs its false-positive rate is ~23% (range 14-28%), not ~15%,
+while its recall is slightly higher (0.80-0.87). Its per-request cost is ~260x
+the rule-based detector's. Tuning the ML false-alarm rate is therefore the
+first item for the second half of the semester.

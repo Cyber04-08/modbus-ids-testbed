@@ -26,6 +26,8 @@ time, memory).
   and an Isolation Forest anomaly detector, compared head-to-head on the same
   traffic with precision/recall/F1/FPR, detection latency, and per-request
   cost/memory. See below.
+- **Multi-run statistics - done.** `detectors/multi_run.py` repeats the whole
+  capture + evaluation 10 times and reports mean +/- 95% confidence intervals.
 
 ## Quick start
 
@@ -74,6 +76,7 @@ pip install numpy pandas scikit-learn
 python testbed/capture_baseline.py            # -> data/baseline_capture.csv (normal only, for ML training)
 python attacks/run_scenario.py && python data/label_dataset.py   # -> data/labeled.csv (mixed, test set)
 python detectors/evaluate.py                  # head-to-head comparison
+python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
 ```
 
 - `detectors/features.py` - shared feature extraction (both detectors score
@@ -91,11 +94,12 @@ python detectors/evaluate.py                  # head-to-head comparison
   precision/recall/F1/FPR, mean detection latency, and per-request processing
   time + peak memory.
 
-Representative result (exact numbers vary per capture; the trade-off is
-stable): the rule-based detector reaches precision ~1.0 with a 0 false-positive
-rate at a few microseconds and KB per request, but misses *well-formed*
-malicious commands (recall ~0.67); the Isolation Forest reaches higher recall
-(~0.80) and lower injection-detection latency, but at a ~15% false-positive
-rate and roughly two orders of magnitude more processing time and memory. That
+Result over 10 independent runs (731 requests, 150 attacks; mean +/- 95% CI):
+the rule-based detector reaches precision 1.00 with a 0 false-positive rate at
+~0.0035 ms and ~2 KB, but misses *well-formed* malicious commands (recall
+0.67, identical every run); the Isolation Forest reaches higher recall
+(0.85 +/- 0.02) and lower injection-detection latency (0.50 s vs 1.50 s), but at
+a 0.23 +/- 0.03 false-positive rate and ~260x the processing time (0.92 ms) and
+~750 KB of memory. That
 accuracy-versus-operational-cost trade-off, measured head-to-head on unmodified
 Modbus/TCP, is the project's contribution.

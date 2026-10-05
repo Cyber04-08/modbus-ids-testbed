@@ -91,10 +91,11 @@ def eval_rule_based(train_df, test_df):
     }
 
 
-def eval_ml(train_df, test_df, contamination):
+def eval_ml(train_df, test_df, contamination, random_state=None):
     tracemalloc.start()
     t0 = time.perf_counter()
-    det = MLAnomalyDetector(contamination=contamination).fit(train_df)
+    kw = {} if random_state is None else {"random_state": random_state}
+    det = MLAnomalyDetector(contamination=contamination, **kw).fit(train_df)
     train_ms = 1000 * (time.perf_counter() - t0)
 
     t1 = time.perf_counter()

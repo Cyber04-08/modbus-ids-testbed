@@ -38,13 +38,14 @@ RANDOM_STATE = 42
 
 
 class MLAnomalyDetector:
-    def __init__(self, contamination: float = DEFAULT_CONTAMINATION):
+    def __init__(self, contamination: float = DEFAULT_CONTAMINATION,
+                 random_state: int = RANDOM_STATE):
         self.contamination = contamination
         self.scaler = StandardScaler()
         self.model = IsolationForest(
             n_estimators=200,
             contamination=contamination,
-            random_state=RANDOM_STATE,
+            random_state=random_state,
         )
 
     def fit(self, benign_df) -> "MLAnomalyDetector":
