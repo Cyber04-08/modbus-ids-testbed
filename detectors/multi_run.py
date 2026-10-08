@@ -63,7 +63,7 @@ SUMMARY_CSV = DATA_DIR / "multi_run_summary.csv"
 
 METRICS = ["precision", "recall", "f1", "fpr", "accuracy",
            "latency_replay_s", "latency_injection_s",
-           "per_request_ms", "peak_kb"]
+           "per_request_ms", "peak_kb", "model_kb", "train_peak_kb", "train_ms"]
 
 # Two-sided 95% Student-t critical values by degrees of freedom (n - 1).
 T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
@@ -110,6 +110,9 @@ def score_run(train_df, test_csv: Path, seed: int, contamination: float) -> list
             "latency_injection_s": lat.get("injection"),
             "per_request_ms": cost["per_request_ms"],
             "peak_kb": cost["peak_kb"],
+            "model_kb": cost["model_kb"],
+            "train_peak_kb": cost["train_peak_kb"],
+            "train_ms": cost["train_ms"],
         })
     return rows
 
@@ -188,7 +191,9 @@ def main() -> None:
         cells = []
         for det in ("rule-based", "ml-iforest"):
             s = by[(det, m)]
-            fmt = ".4f" if m == "per_request_ms" else (".0f" if m == "peak_kb" else ".3f")
+            fmt = (".4f" if m == "per_request_ms" else
+                   ".0f" if m in ("peak_kb", "model_kb", "train_peak_kb") else
+                   ".1f" if m == "train_ms" else ".3f")
             cell = f"{s['mean']:{fmt}} ± {s['ci95_high'] - s['mean']:{fmt}}"
             if s["missed"]:
                 cell += f" ({s['missed']} missed)"
@@ -197,7 +202,9 @@ def main() -> None:
     for m in ("pooled_precision", "pooled_recall", "pooled_fpr"):
         print(f"{m:<22}{by[('rule-based', m)]['mean']:>26.3f}"
               f"{by[('ml-iforest', m)]['mean']:>26.3f}")
-    print("\n(± is the 95% confidence half-width over runs)")
+    print("\n(± is the 95% confidence half-width over runs; peak_kb is detection only,\n"
+          " train_peak_kb / train_ms are the one-time training step, model_kb is what\n"
+          " the built detector keeps in memory while detecting)")
     print(f"per-run rows -> {RESULTS_CSV}\nsummary      -> {SUMMARY_CSV}")
 
 

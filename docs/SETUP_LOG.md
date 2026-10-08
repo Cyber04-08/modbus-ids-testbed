@@ -456,3 +456,38 @@ test fractions the old method used (0.17-0.20), so ML flags slightly less:
 FPR 0.227 -> 0.182, precision 0.496 -> 0.531. Scoring the same new data with
 the old leaky setting gives P 0.507 / R 0.900 / FPR 0.203 - the leak flattered
 ML recall a little. The accuracy-versus-cost trade-off is unchanged.
+
+## Separating training memory from detection memory (A4 feedback)
+
+Instructor feedback on Progress Report 2 (A4): "separate ML training memory
+from detection memory to make the cost comparison fair." Confirmed in code:
+`eval_ml()` measured one tracemalloc peak across both `fit()` and `predict()`,
+so the reported ML "peak memory" (~755 KB) was really the training peak, while
+the rule-based figure covered detection only. (Per-request time was already
+measured on `predict()` alone.)
+
+Fix in `detectors/evaluate.py` (used by `multi_run.py`): three separate
+measurements per detector.
+- `train_peak_kb` / `train_ms`: building the detector (ML: fitting the
+  forest; rules: loading the config). One-time, offline.
+- `model_kb`: memory the built detector keeps holding while it detects.
+- `peak_kb`: peak extra memory while scoring the test traffic.
+
+Each detector is also exercised once, unmeasured, before it is measured. The
+first scikit-learn fit in a process loads code and caches; without the
+warm-up, run 1 showed ~790 KB model memory against ~723 KB for runs 2-10.
+
+Re-scored the same 10 saved test runs (`python detectors/multi_run.py
+--reuse`); detection-quality numbers are unchanged (same runs, same seeds).
+Previous results kept in `data/v2_before_memory_split/`.
+
+| cost (mean +/- 95% CI half-width) | rule-based | ML (iForest) |
+|---|---|---|
+| detection time per request | 0.0027 ms | 0.565 +/- 0.022 ms |
+| detection peak memory | 3 KB | 26 KB |
+| model held in memory | 0.3 KB | 723 +/- 3 KB |
+| training peak memory (one-time) | 0.3 KB | 747 +/- 3 KB |
+| training time (one-time) | 0 | 1985 +/- 16 ms |
+
+Per-request time is lower than the earlier 0.80 ms figure; timing varies with
+machine load, the ~200x ratio holds.

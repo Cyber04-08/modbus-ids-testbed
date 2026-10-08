@@ -98,16 +98,21 @@ python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
   taken from the test set.
 - `detectors/evaluate.py` - runs both over the same test set and reports
   precision/recall/F1/FPR, mean detection latency, and detector processing
-  cost (per-request time + peak memory). The detectors read a recorded copy
-  of the traffic and are not in the control path, so this is the monitoring
-  host's cost, not a control-loop delay.
+  cost (per-request time + memory). Training and detection memory are
+  measured in separate windows: the one-time training peak, the memory the
+  built model keeps holding, and the peak while scoring traffic. The
+  detectors read a recorded copy of the traffic and are not in the control
+  path, so this is the monitoring host's cost, not a control-loop delay.
 
 Result over 10 independent test sessions (750 scored requests, 140 attacks;
 mean +/- 95% CI): the rule-based detector reaches precision 1.00 with a 0
-false-positive rate at ~0.0035 ms and ~3 KB per request, but misses
-*well-formed* malicious commands (recall 0.71, identical every run); the
-Isolation Forest reaches higher recall (0.87 +/- 0.02) and lower
+false-positive rate at ~0.003 ms per request and ~3 KB while detecting, but
+misses *well-formed* malicious commands (recall 0.71, identical every run);
+the Isolation Forest reaches higher recall (0.87 +/- 0.02) and lower
 injection-detection latency (0.50 s vs 1.50 s), but at a 0.18 +/- 0.03
-false-positive rate and roughly 200x the processing cost (0.80 ms) and ~750 KB
-of memory. That accuracy-versus-processing-cost trade-off, measured
-head-to-head on unmodified Modbus/TCP, is the project's contribution.
+false-positive rate and roughly 200x the processing time (~0.56 ms per
+request). Memory, split fairly: while detecting, the forest uses ~26 KB
+(vs ~3 KB) but must also keep its ~723 KB trained model in memory (the rules
+need under 1 KB); training is a separate one-time step (~2 s, ~747 KB peak).
+That accuracy-versus-processing-cost trade-off, measured head-to-head on
+unmodified Modbus/TCP, is the project's contribution.

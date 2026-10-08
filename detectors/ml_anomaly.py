@@ -8,11 +8,35 @@ and flags requests that don't fit that profile as anomalies. This is the
 learned counterpart to the rule-based detector, and the head-to-head between
 the two - on the same traffic, same metrics - is the project's core question.
 
-Isolation Forest (Liu et al.) isolates points with random splits; anomalies
-need fewer splits to isolate, so they score as outliers. Chosen over one-class
-SVM as the primary model for speed and its native handling of the benign/attack
-imbalance via the `contamination` parameter, which we set to the expected
-attack fraction rather than leaving at the default (per the proposal).
+How Isolation Forest finds unusual traffic (Liu et al., 2008):
+  1. Build 200 random trees from the normal traffic. Each tree repeatedly
+     picks a random feature (e.g. register value) and a random cut point
+     between that feature's min and max, splitting the requests in two,
+     until every request sits alone in its own leaf.
+  2. A typical request looks like many others, so it takes many cuts to
+     separate it from its neighbours: it ends up deep in the tree. An odd
+     request (a write to an unusual address, an extreme value, odd timing)
+     sits apart from the crowd and is cut off after only a few splits.
+  3. A request's anomaly score comes from its average depth across all 200
+     trees: short average path = easy to isolate = anomalous.
+
+How its sensitivity is chosen: the score is continuous, so a cut-off turns it
+into yes/no alerts. `contamination` sets that cut-off: scikit-learn places
+the threshold so that exactly that share of the *training* requests would be
+flagged. We do not leave it at a default or read it from the test data:
+evaluate.contamination_from() sets it to the attack share measured in a
+separate tuning session (0.177), so the test answers never influence it.
+Higher contamination = more alerts (higher recall, more false alarms); lower
+= fewer alerts.
+
+Consequence worth knowing: the training data is all normal, so a 0.177
+setting tells the model to treat the most unusual ~18% of *normal* traffic
+as anomalous. That is why its false-positive rate (~0.18) tracks the
+contamination value, and why lowering it trades recall for fewer false
+alarms.
+
+Chosen over one-class SVM as the primary model for speed and its native
+handling of the benign/attack imbalance via `contamination`.
 
 Features are standardized (StandardScaler) so no single wide-range column
 (e.g. a 0-60000 register value) dominates the split geometry.

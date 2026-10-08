@@ -11,7 +11,9 @@ test traffic and reports, for each, exactly the metrics the proposal commits to:
     an attack to the detector's first alert on that attack.
   * Operational cost: mean per-request processing time and peak memory, the
     "can this run next to real equipment?" numbers that neither prior work
-    reports for a head-to-head.
+    reports for a head-to-head. Training (one-time) and detection (recurring)
+    are measured separately so the ML training step does not inflate its
+    detection cost.
 
 Three independent capture sessions, never mixed (no train/tune/test leakage):
   * train = data/baseline_capture.csv  (normal only; the ML model fits on this)
@@ -95,10 +97,36 @@ def contamination_from(tune_df) -> float:
     return min(max(float(y.mean()), 0.01), 0.5)
 
 
-def eval_rule_based(train_df, test_df):
-    det = RuleBasedDetector()  # config-driven; no training needed
-    rows = list(test_df.itertuples(index=False))
+# Memory is measured in separate tracemalloc windows so training and detection
+# are never mixed:
+#   train_peak_kb - peak while building the detector (ML: fitting the forest;
+#                   rules: loading the config). A one-time, offline cost.
+#   model_kb      - memory the built detector keeps holding afterwards; it
+#                   must stay resident for as long as detection runs.
+#   peak_kb       - peak extra memory while scoring the test traffic, the
+#                   recurring cost compared head-to-head.
+# Each detector is exercised once, unmeasured, before its first measurement:
+# the first scikit-learn fit/predict in a process loads code and caches that
+# would otherwise be counted as model memory in that one run only.
 
+_warmed: set[str] = set()
+
+
+def _warm_up(name, fn) -> None:
+    if name not in _warmed:
+        fn()
+        _warmed.add(name)
+
+
+def eval_rule_based(train_df, test_df):
+    _warm_up("rule-based", lambda: [RuleBasedDetector().score_request(r)
+                                    for r in test_df.head(5).itertuples(index=False)])
+    tracemalloc.start()
+    det = RuleBasedDetector()  # config-driven; no training needed
+    model_bytes, build_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    rows = list(test_df.itertuples(index=False))
     tracemalloc.start()
     t0 = time.perf_counter()
     preds = np.array([det.score_request(r)[0] for r in rows])
@@ -110,16 +138,23 @@ def eval_rule_based(train_df, test_df):
         "per_request_ms": 1000 * elapsed / max(len(rows), 1),
         "peak_kb": peak / 1024,
         "train_ms": 0.0,
+        "train_peak_kb": build_peak / 1024,
+        "model_kb": model_bytes / 1024,
     }
 
 
 def eval_ml(train_df, test_df, contamination, random_state=None):
+    kw = {} if random_state is None else {"random_state": random_state}
+    _warm_up("ml", lambda: MLAnomalyDetector(contamination=contamination, **kw)
+             .fit(train_df).predict(test_df.head(5)))
     tracemalloc.start()
     t0 = time.perf_counter()
-    kw = {} if random_state is None else {"random_state": random_state}
     det = MLAnomalyDetector(contamination=contamination, **kw).fit(train_df)
     train_ms = 1000 * (time.perf_counter() - t0)
+    model_bytes, train_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
 
+    tracemalloc.start()
     t1 = time.perf_counter()
     preds = det.predict(test_df)
     predict_elapsed = time.perf_counter() - t1
@@ -130,6 +165,8 @@ def eval_ml(train_df, test_df, contamination, random_state=None):
         "per_request_ms": 1000 * predict_elapsed / max(len(test_df), 1),
         "peak_kb": peak / 1024,
         "train_ms": train_ms,
+        "train_peak_kb": train_peak / 1024,
+        "model_kb": model_bytes / 1024,
     }
 
 
@@ -142,9 +179,10 @@ def print_report(name, q, cost, latency):
     for atk, v in latency.items():
         lat_bits.append(f"{atk}={'MISSED' if v is None else f'{v:.3f}s'}")
     print(f"  detection latency: {'  '.join(lat_bits) if lat_bits else 'n/a'}")
-    print(f"  cost: {cost['per_request_ms']:.4f} ms/request   "
-          f"peak {cost['peak_kb']:.0f} KB"
-          + (f"   train {cost['train_ms']:.1f} ms" if cost['train_ms'] else ""))
+    print(f"  detection cost: {cost['per_request_ms']:.4f} ms/request   "
+          f"peak {cost['peak_kb']:.0f} KB   (model held: {cost['model_kb']:.0f} KB)")
+    print(f"  build/training cost (one-time): {cost['train_ms']:.1f} ms   "
+          f"peak {cost['train_peak_kb']:.0f} KB")
 
 
 def main() -> None:
@@ -194,7 +232,10 @@ def main() -> None:
         print(f"{label:<18}{rb_q[key]:>14.3f}{ml_q[key]:>16.3f}")
     print(f"{'ms/request':<18}{rb_cost['per_request_ms']:>14.4f}"
           f"{ml_cost['per_request_ms']:>16.4f}")
-    print(f"{'peak KB':<18}{rb_cost['peak_kb']:>14.0f}{ml_cost['peak_kb']:>16.0f}")
+    print(f"{'detect peak KB':<18}{rb_cost['peak_kb']:>14.0f}{ml_cost['peak_kb']:>16.0f}")
+    print(f"{'model held KB':<18}{rb_cost['model_kb']:>14.0f}{ml_cost['model_kb']:>16.0f}")
+    print(f"{'train peak KB':<18}{rb_cost['train_peak_kb']:>14.0f}{ml_cost['train_peak_kb']:>16.0f}")
+    print(f"{'train ms':<18}{rb_cost['train_ms']:>14.1f}{ml_cost['train_ms']:>16.1f}")
 
 
 if __name__ == "__main__":
