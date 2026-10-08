@@ -11,3 +11,4 @@ data/*.json
 data/.hmi_port
 data/runs/
 data/v1_before_feedback/
+data/v2_before_memory_split/
