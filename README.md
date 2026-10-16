@@ -32,7 +32,11 @@ time, memory).
   zeroed every write value in the training data; added a tuned ML detector
   whose alert threshold is chosen on the tuning session; measured how training
   length affects it (`detectors/training_curve.py`). See `docs/SETUP_LOG.md`.
-  Next: one-class SVM, Zeek/Suricata, GRFICSv2 replication, varied attacks.
+- **Second half, item 2 (one-class SVM) - done.** `detectors/ocsvm.py`, with
+  a transaction-ID-change feature the forest cannot use. Over the 10 runs it
+  matches the rules' zero false alarms and catches more attacks (F1 0.96 vs
+  0.83), at ~0.03 ms per request. Next: Zeek/Suricata, GRFICSv2 replication,
+  varied and harder attacks.
 
 ## Quick start
 
@@ -106,7 +110,11 @@ python detectors/training_curve.py            # ML quality vs training length
   threshold at the best F1 on that tuning session and fills each connection's
   first (placeholder) inter-arrival with the median training gap; both are
   reported side by side.
-- `detectors/evaluate.py` - runs all three over the same test set and reports
+- `detectors/ocsvm.py` - one-class SVM (RBF kernel) trained on normal
+  traffic only, on the same five features plus the change in transaction ID
+  on the connection (normal = +1, verbatim replay = 0); alert threshold at
+  the best F1 on the tuning session.
+- `detectors/evaluate.py` - runs all four over the same test set and reports
   precision/recall/F1/FPR, mean detection latency, and detector processing
   cost (per-request time + memory). Training and detection memory are
   measured in separate windows: the one-time training peak, the memory the
@@ -129,3 +137,10 @@ one-time step (~2 s, ~740 KB peak). (Figures updated 2026-10-15 after fixing
 a bug that zeroed write values in the training data; see `docs/SETUP_LOG.md`.)
 That accuracy-versus-processing-cost trade-off, measured head-to-head on
 unmodified Modbus/TCP, is the project's contribution.
+
+Adding a one-class SVM (2026-10-15) changes that picture: on the same 10 runs
+it reaches precision 1.00, recall 0.93 (F1 0.96) and a 0 false-positive rate,
+catching every replay and all injections but one, at ~0.03 ms per request with
+a 10 KB model and 14 ms of training. Caveats (see `docs/SETUP_LOG.md`): some
+injections are caught by timing alone, the replay signal depends on reused
+transaction IDs, and the tuning and test sessions share one attack sequence.

@@ -3,12 +3,13 @@ Training-length curve - how much normal traffic does the ML detector need?
 
 Takes one long normal-only capture (e.g. 60 minutes, recorded with
 `python testbed/capture_baseline.py 3600 data/baseline_60min.csv`) and trains
-the Isolation Forest on its first 1, 2, 5, ... minutes. Each training length
-is scored on the same saved test runs (data/runs/run_XX.csv), for both ML
-variants:
+the ML detectors on its first 1, 2, 5, ... minutes. Each training length
+is scored on the same saved test runs (data/runs/run_XX.csv), for each ML
+detector:
 
     ml-iforest - contamination cut-off (0.177 from the tuning session)
     ml-tuned   - first-gap fill + threshold calibrated on the tuning session
+    ocsvm      - one-class SVM, threshold calibrated on the tuning session
 
 Train, tune and test are still separate sessions: only the amount of the
 training session used changes. The Isolation Forest is re-seeded per run as
@@ -30,7 +31,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from evaluate import contamination_from, eval_ml, quality_metrics, scored_mask  # noqa: E402
+from evaluate import (contamination_from, eval_ml, eval_ocsvm,  # noqa: E402
+                      quality_metrics, scored_mask)
 from features import load_requests                                           # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,13 +57,16 @@ def main() -> None:
         if minutes > span_min + 0.5:
             break
         train = full[full["wall_time"] < full["wall_time"].iloc[0] + 60 * minutes]
-        for name, tune in (("ml-iforest", None), ("ml-tuned", tune_df)):
+        for name, tune in (("ml-iforest", None), ("ml-tuned", tune_df), ("ocsvm", tune_df)):
             tot = np.zeros(4, int)
             fprs, train_ms, model_kb = [], [], []
             for seed, test in enumerate(runs):
                 mask = scored_mask(test)
-                pred, cost = eval_ml(train, test, contamination, random_state=seed,
-                                     tune_df=tune)
+                if name == "ocsvm":
+                    pred, cost = eval_ocsvm(train, test, tune)
+                else:
+                    pred, cost = eval_ml(train, test, contamination, random_state=seed,
+                                         tune_df=tune)
                 q = quality_metrics(test["is_attack"].to_numpy()[mask], pred[mask])
                 tot += [q["TP"], q["FP"], q["FN"], q["TN"]]
                 fprs.append(q["fpr"])

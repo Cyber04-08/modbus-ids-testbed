@@ -50,7 +50,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evaluate import (contamination_from, detection_latency, eval_ml,  # noqa: E402
-                      eval_rule_based, quality_metrics, scored_mask)
+                      eval_ocsvm, eval_rule_based, quality_metrics, scored_mask)
 from features import load_requests                                 # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,7 +66,7 @@ METRICS = ["precision", "recall", "f1", "fpr", "accuracy",
            "latency_replay_s", "latency_injection_s",
            "per_request_ms", "peak_kb", "model_kb", "train_peak_kb", "train_ms"]
 
-DETECTORS = ("rule-based", "ml-iforest", "ml-tuned")
+DETECTORS = ("rule-based", "ml-iforest", "ml-tuned", "ocsvm")
 
 # Two-sided 95% Student-t critical values by degrees of freedom (n - 1).
 T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
@@ -103,6 +103,7 @@ def score_run(train_df, tune_df, test_csv: Path, seed: int,
         ("ml-iforest", eval_ml(train_df, test_df, contamination, random_state=seed)),
         ("ml-tuned", eval_ml(train_df, test_df, contamination, random_state=seed,
                              tune_df=tune_df)),
+        ("ocsvm", eval_ocsvm(train_df, test_df, tune_df)),
     ):
         q = quality_metrics(y, pred[mask])
         lat = detection_latency(test_df, pred)
@@ -191,8 +192,9 @@ def main() -> None:
     print(f"\nModbus/TCP IDS - {len(run_files)}-run comparison "
           f"(train: {len(train_df)} benign requests; ML contamination "
           f"{contamination:.3f} from the tuning session)")
-    print(f"{'metric':<22}{'rule-based':>24}{'ML (iForest)':>24}{'ML (tuned)':>24}")
-    print("-" * 94)
+    print(f"{'metric':<22}{'rule-based':>22}{'ML (iForest)':>22}{'ML (tuned)':>22}"
+          f"{'OC-SVM':>22}")
+    print("-" * 110)
     by = {(s["detector"], s["metric"]): s for s in summary}
     for m in METRICS:
         cells = []
@@ -205,9 +207,9 @@ def main() -> None:
             if s["missed"]:
                 cell += f" ({s['missed']} missed)"
             cells.append(cell)
-        print(f"{m:<22}" + "".join(f"{c:>24}" for c in cells))
+        print(f"{m:<22}" + "".join(f"{c:>22}" for c in cells))
     for m in ("pooled_precision", "pooled_recall", "pooled_fpr"):
-        print(f"{m:<22}" + "".join(f"{by[(d, m)]['mean']:>24.3f}" for d in DETECTORS))
+        print(f"{m:<22}" + "".join(f"{by[(d, m)]['mean']:>22.3f}" for d in DETECTORS))
     print("\n(± is the 95% confidence half-width over runs; peak_kb is detection only,\n"
           " train_peak_kb / train_ms are the one-time training step, model_kb is what\n"
           " the built detector keeps in memory while detecting)")

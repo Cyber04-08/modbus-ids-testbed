@@ -25,6 +25,13 @@ import pandas as pd
 # inter-packet timing per connection.
 ML_FEATURE_COLUMNS = ["function_code", "address", "value0", "count", "inter_arrival"]
 
+# The one-class SVM also sees the change in transaction ID from the previous
+# request on the same connection. A normal master always adds 1; a verbatim
+# replay repeats the old ID (change 0). The Isolation Forest is left on the
+# five columns above: the change is constant in normal traffic, so a forest
+# trained on it never splits on it (tested, no effect).
+OCSVM_FEATURE_COLUMNS = ML_FEATURE_COLUMNS + ["txid_delta"]
+
 
 def _first_value(values_field: str) -> float:
     """First integer in the space-separated `values` column (0 for reads,
@@ -63,6 +70,11 @@ def load_requests(csv_path: str) -> pd.DataFrame:
         df.groupby("client_port")["wall_time"].diff().fillna(0.0)
     )
     df["first_on_connection"] = df.groupby("client_port").cumcount() == 0
+    # Change in transaction ID on the same connection (first request -> 1,
+    # i.e. treated as a normal increment).
+    df["txid_delta"] = (
+        df.groupby("client_port")["transaction_id"].diff().fillna(1.0)
+    )
 
     if "is_attack" in df.columns:
         # A blank is_attack marks a request the detectors still see (it is part
@@ -75,6 +87,6 @@ def load_requests(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
-    """Numeric feature matrix (rows = requests) for the ML detector."""
-    return df[ML_FEATURE_COLUMNS].to_numpy(dtype=float)
+def build_feature_matrix(df: pd.DataFrame, columns=None) -> np.ndarray:
+    """Numeric feature matrix (rows = requests) for an ML detector."""
+    return df[columns or ML_FEATURE_COLUMNS].to_numpy(dtype=float)

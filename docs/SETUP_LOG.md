@@ -575,3 +575,66 @@ Caveat: the threshold is set on one tuning session of 79 scored requests (14
 attacks) whose attack sequence is the same as the test sessions', so the tuned
 numbers are likely optimistic and the chosen point is coarse (wide per-run FPR
 ranges). Varied attacks are a later item.
+
+## 2026-10-15 - Second half, item 2: one-class SVM
+
+New detector `detectors/ocsvm.py` (`OneClassSVMDetector`): RBF one-class SVM,
+standardized features, trained on normal traffic only, alert threshold at the
+best F1 on the tuning session (`ml_anomaly.best_f1_threshold`, now shared),
+first-gap fill as in the tuned forest. `nu = 0.05`; with the tuned threshold,
+nu = 0.01, 0.05 and 0.177 gave identical results. With sklearn's own nu
+boundary instead (no tuning) its FPR was 0.25-0.31, worse than the forest.
+
+Features: the forest's five plus `txid_delta`, the change in transaction ID
+from the previous request on the same connection (`features.py`; first
+request -> 1). Normal masters always add 1; a verbatim replay repeats the ID
+(0). Tested on both models (scratch experiment, 10 saved runs, tuned
+threshold):
+
+| model / features | precision | recall | FPR |
+|---|---|---|---|
+| Isolation Forest, 5 features | 0.605 | 0.929 | 0.139 |
+| Isolation Forest + txid_delta | 0.591 | 0.929 | 0.148 |
+| One-class SVM, 5 features | 1.000 | 0.514 | 0.000 |
+| One-class SVM + txid_delta | 1.000 | 0.929 | 0.000 |
+
+The forest cannot use the feature (it is constant in normal training data, so
+no tree ever cuts on it); the SVM measures distance, so a 0 change sits away
+from every normal request. Without it the SVM misses every replay; with it
+the SVM recovers them. The forest keeps its original five features.
+
+Official 10 saved runs (`python detectors/multi_run.py --reuse`, 60 s training
+session), mean +/- 95% CI:
+
+| | rule-based | iForest (contamination) | iForest (tuned) | one-class SVM |
+|---|---|---|---|---|
+| precision | 1.000 | 0.549 +/- 0.064 | 0.614 +/- 0.058 | 1.000 |
+| recall | 0.714 | 0.929 | 0.929 | 0.929 |
+| F1 | 0.833 | 0.686 +/- 0.048 | 0.736 +/- 0.042 | 0.963 |
+| FPR | 0.000 | 0.182 +/- 0.037 | 0.139 +/- 0.032 | 0.000 |
+| injection latency | 1.50 s | 0 s | 0 s | 0 s |
+| detection ms/request | 0.0031 | 0.577 | 0.603 | 0.034 |
+| detection peak memory | 3 KB | 26 KB | 23 KB | 14 KB |
+| model held | 0.3 KB | 718 KB | 737 KB | 10 KB (8 support vectors) |
+| training (one-time) | 0 | 2.0 s, 742 KB | 2.1 s, 778 KB | 14 ms, 49 KB |
+
+Robustness checks: every normal request scores well below every attack at
+60 s, 5 min and 60 min of training (FPR 0 at all three). The one miss per run
+is always the same injection, a well-formed "close outlet valve" (FC5 coil 1
+OFF), which the rules also miss; it scores just under the threshold.
+
+Limitations to state with this result:
+- Some injections are separated only by timing (sent 0.5 s apart, while
+  normal writes follow a poll within ~2 ms). An attacker matching normal
+  timing would likely evade the SVM on those.
+- The replay signal is the reused transaction ID. A replay that rewrites the
+  ID to the next expected value would remove it (for the rules too).
+- Tuning and test sessions use the same attack sequence, so the threshold is
+  set on attacks identical to the test attacks. Varied/harder attacks are the
+  next items to test these three points.
+
+Training-length curve with the SVM added (`python detectors/training_curve.py`,
+same 60-minute capture, 10 runs pooled): the one-class SVM has precision
+1.000 and FPR 0.000 at every length from 1 to 60 minutes (recall 0.950 at
+1 min, 0.929 from 2 min on). Training time grows from 13 ms to 78 ms and the
+model from 10 KB to 23 KB; the forests stay at ~2 s and ~1 MB.

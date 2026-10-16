@@ -1,7 +1,8 @@
 """
 Evaluation harness - the head-to-head comparison (Phase 4 core).
 
-Runs the rule-based detector and the ML anomaly detector over the SAME labeled
+Runs the rule-based detector and the ML anomaly detectors (Isolation Forest,
+as originally configured and tuned, and a one-class SVM) over the SAME labeled
 test traffic and reports, for each, exactly the metrics the proposal commits to:
 
   * Detection quality: precision, recall, F1, false-positive rate (FPR).
@@ -49,6 +50,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from features import load_requests               # noqa: E402
 from ml_anomaly import MLAnomalyDetector          # noqa: E402
+from ocsvm import OneClassSVMDetector             # noqa: E402
 from rule_based import RuleBasedDetector          # noqa: E402
 
 
@@ -180,6 +182,36 @@ def eval_ml(train_df, test_df, contamination, random_state=None, tune_df=None):
     }
 
 
+def eval_ocsvm(train_df, test_df, tune_df):
+    """One-class SVM: trained on normal traffic, threshold calibrated on the
+    tuning session (calibration counted as part of training)."""
+    def build():
+        return OneClassSVMDetector().fit(train_df).calibrate(tune_df)
+
+    _warm_up("ocsvm", lambda: build().predict(test_df.head(5)))
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    det = build()
+    train_ms = 1000 * (time.perf_counter() - t0)
+    model_bytes, train_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    tracemalloc.start()
+    t1 = time.perf_counter()
+    preds = det.predict(test_df)
+    predict_elapsed = time.perf_counter() - t1
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return preds, {
+        "per_request_ms": 1000 * predict_elapsed / max(len(test_df), 1),
+        "peak_kb": peak / 1024,
+        "train_ms": train_ms,
+        "train_peak_kb": train_peak / 1024,
+        "model_kb": model_bytes / 1024,
+    }
+
+
 def print_report(name, q, cost, latency):
     print(f"\n=== {name} ===")
     print(f"  precision {q['precision']:.3f}   recall {q['recall']:.3f}   "
@@ -238,21 +270,30 @@ def main() -> None:
     print_report("ML anomaly detector (Isolation Forest, threshold tuned on tuning session)",
                  mt_q, mt_cost, mt_lat)
 
+    sv_pred, sv_cost = eval_ocsvm(train_df, test_df, tune_df)
+    sv_q = quality_metrics(y, sv_pred[mask])
+    sv_lat = detection_latency(test_df, sv_pred)
+    print_report("ML anomaly detector #2 (one-class SVM, threshold tuned on tuning session)",
+                 sv_q, sv_cost, sv_lat)
+
     # Compact side-by-side for the report.
     print("\n=== side-by-side ===")
-    hdr = f"{'metric':<18}{'rule-based':>14}{'ML (iForest)':>16}{'ML (tuned)':>14}"
+    hdr = (f"{'metric':<18}{'rule-based':>14}{'ML (iForest)':>16}{'ML (tuned)':>14}"
+           f"{'OC-SVM':>10}")
     print(hdr)
     print("-" * len(hdr))
     for key, label in [("precision", "precision"), ("recall", "recall"),
                        ("f1", "F1"), ("fpr", "false-pos rate"),
                        ("accuracy", "accuracy")]:
-        print(f"{label:<18}{rb_q[key]:>14.3f}{ml_q[key]:>16.3f}{mt_q[key]:>14.3f}")
+        print(f"{label:<18}{rb_q[key]:>14.3f}{ml_q[key]:>16.3f}{mt_q[key]:>14.3f}"
+              f"{sv_q[key]:>10.3f}")
     for key, label, fmt in [("per_request_ms", "ms/request", ".4f"),
                             ("peak_kb", "detect peak KB", ".0f"),
                             ("model_kb", "model held KB", ".0f"),
                             ("train_peak_kb", "train peak KB", ".0f"),
                             ("train_ms", "train ms", ".1f")]:
-        print(f"{label:<18}{rb_cost[key]:>14{fmt}}{ml_cost[key]:>16{fmt}}{mt_cost[key]:>14{fmt}}")
+        print(f"{label:<18}{rb_cost[key]:>14{fmt}}{ml_cost[key]:>16{fmt}}{mt_cost[key]:>14{fmt}}"
+              f"{sv_cost[key]:>10{fmt}}")
 
 
 if __name__ == "__main__":

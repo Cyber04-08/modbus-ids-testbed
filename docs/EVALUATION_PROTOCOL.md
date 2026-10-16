@@ -66,7 +66,7 @@ for another role.
 | Role | Produced by | File | Used for |
 |---|---|---|---|
 | Train | `testbed/capture_baseline.py` | `data/baseline_capture.csv` | Fitting the Isolation Forest (normal traffic only) |
-| Tune | `attacks/capture_tuning.py` | `data/tuning_labeled.csv` | Choosing the ML contamination (its attack fraction) and, for the tuned ML detector, its alert threshold (best F1 on this session) |
+| Tune | `attacks/capture_tuning.py` | `data/tuning_labeled.csv` | Choosing the ML contamination (its attack fraction) and, for the tuned ML detector and the one-class SVM, the alert threshold (best F1 on this session) |
 | Test (x10) | `detectors/multi_run.py` (scenario + labeler per run) | `data/runs/run_XX.csv` | Final scoring only |
 
 The rule-based detector has no trained or tuned parameters: its rules come

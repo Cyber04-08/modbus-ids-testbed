@@ -73,6 +73,27 @@ DEFAULT_CONTAMINATION = 0.1   # expected outlier fraction; tune to the data
 RANDOM_STATE = 42
 
 
+def best_f1_threshold(detector, tune_df) -> float:
+    """The anomaly score, among those seen in the labeled tuning session,
+    that gives the best F1 when used as the alert threshold (ties -> fewer
+    false alarms). Shared by every ML detector with a score() method."""
+    if "scored" in tune_df.columns:
+        tune_df = tune_df[tune_df["scored"]]
+    scores = detector.score(tune_df)
+    y = tune_df["is_attack"].to_numpy()
+    best = None
+    for t in np.unique(scores):
+        pred = scores >= t
+        tp = int((pred & (y == 1)).sum())
+        fp = int((pred & (y == 0)).sum())
+        fn = int((~pred & (y == 1)).sum())
+        f1 = 2 * tp / (2 * tp + fp + fn) if tp else 0.0
+        key = (f1, -fp)
+        if best is None or key > best[0]:
+            best = (key, float(t))
+    return best[1]
+
+
 class MLAnomalyDetector:
     def __init__(self, contamination: float = DEFAULT_CONTAMINATION,
                  random_state: int = RANDOM_STATE, fill_first_gap: bool = False):
@@ -113,23 +134,9 @@ class MLAnomalyDetector:
 
     def calibrate(self, tune_df) -> "MLAnomalyDetector":
         """Place the alert threshold at the score that gives the best F1 on the
-        labeled TUNING session (ties -> fewer false alarms). Only that
-        session's labels are used; test labels never are."""
-        if "scored" in tune_df.columns:
-            tune_df = tune_df[tune_df["scored"]]
-        scores = self.score(tune_df)
-        y = tune_df["is_attack"].to_numpy()
-        best = None
-        for t in np.unique(scores):
-            pred = scores >= t
-            tp = int((pred & (y == 1)).sum())
-            fp = int((pred & (y == 0)).sum())
-            fn = int((~pred & (y == 1)).sum())
-            f1 = 2 * tp / (2 * tp + fp + fn) if tp else 0.0
-            key = (f1, -fp)
-            if best is None or key > best[0]:
-                best = (key, float(t))
-        self.threshold_ = best[1]
+        labeled TUNING session. Only that session's labels are used; test
+        labels never are."""
+        self.threshold_ = best_f1_threshold(self, tune_df)
         return self
 
     def predict(self, df) -> np.ndarray:
