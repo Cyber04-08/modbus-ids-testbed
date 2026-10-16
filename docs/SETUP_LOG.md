@@ -711,3 +711,78 @@ Reading:
 - "s per run" is a whole tool run on one ~45 s session including start-up;
   stock Suricata spends most of its 101 s loading 53k rules, which a live
   sensor does once. Not comparable to the per-request times of our detectors.
+
+## 2026-10-16 - Second half, item 4: GRFICSv2 replication (higher-fidelity cross-check)
+
+Repeated the detector comparison on the GRFICSv2 plant (real OpenPLC master,
+3D chemical-process simulation feeding 6 Modbus remote-IO devices, ScadaBR
+HMI, pfSense segmentation) instead of the Python testbed.
+
+### Setup
+
+- Sensor VM `ids-sensor` given a second NIC on the plant's ICS network
+  (host-only #5) in promiscuous/listen-only mode (no IP while capturing), so
+  it passively sees all plant Modbus/TCP traffic, like a switch mirror port.
+- GRFICS VMs' host-only adapter had to be repointed #4 -> #5 (Windows had
+  renamed the adapter); snapshots `before-adapter-5` taken first. The DMZ
+  adapter (#3) needed a `Restart-NetAdapter` (admin) before pfSense/ScadaBR
+  would attach - a VirtualBox host-only driver binding that goes stale.
+- `tools/pcap_to_csv.py`: converts a passively captured pcap to our CSV
+  schema (reuses the tap's frame decoder), reassembling each TCP stream by
+  sequence number and skipping retransmitted bytes, and adds src_ip/dst_ip
+  (the plant has real per-host IPs). Handles Ethernet and Linux-cooked links.
+- `tools/grfics_attack.py`: run from the sensor (given a temporary plant IP),
+  the same two attack classes against a remote-IO device - injection (FC16
+  writes the PLC never makes) and replay (one verbatim reused-txid write
+  resent 8x). Ground truth is by source IP.
+- `detectors/grfics_eval.py`: trains on the plant's normal traffic, labels by
+  source IP, groups per-connection features by (src_ip, client_port), and
+  scores the same detectors.
+
+### Normal plant traffic (3 min, 35,520 requests)
+
+- The PLC (192.168.95.2) polls six remote-IO devices (.10-.15): FC4 reads and
+  FC16 writes to register 1. The HMI (192.168.90.5) reads from the PLC through
+  the firewall: FC1 (40 coils) and FC4 (13 registers). Two distinct, real
+  Modbus clients - richer than the testbed's single operator.
+- Connections are short-lived (the PLC reconnects), unlike the testbed's
+  long-lived ones, so per-connection features had to be grouped by
+  (src_ip, client_port), not port alone.
+
+### Pitfalls found
+
+1. Back-to-back captures with overlapping tcpdump windows put several attack
+   runs in one file (counts ~2x, sessions not independent). Fixed by waiting
+   for each capture window to finish before the next attack (`wait $TPID`).
+2. The actuator register legitimately takes the full 0-65535 range (scaled
+   process values), so the water-tank value-range rule does not apply here -
+   an injected 65000 or 0 to the actuator is value-wise normal.
+
+### Results (4 independent attack sessions; 48 attack / 11,644 benign requests)
+
+| detector | precision | recall | F1 | FPR |
+|---|---|---|---|---|
+| rule-based (plant register map) | 1.000 | 0.833 | 0.909 | 0.000 |
+| Isolation Forest (tuned) | 1.000 | 0.167 | 0.286 | 0.000 |
+| one-class SVM | 1.000 | 0.917 | 0.957 | 0.000 |
+
+Per attack type (one-class SVM): replay 32/32, injection 12/16.
+
+Reading (consistent with the testbed, where the SVM led at F1 0.96):
+- The one-class SVM is again the best detector, F1 0.957, no false alarms. It
+  catches every replay (the transaction-ID-change feature) and the injections
+  that touch an unused register.
+- It misses 4 injections: the writes to the *actuator* register with in-range
+  values (65000, 0). Those are "right register, in-range value, wrong sender"
+  - indistinguishable on content alone. GRFICSv2 exposes the real source IP,
+  so a sender-identity feature is the fix, which ties directly into the
+  deferred limitation-1 work.
+- Isolation Forest stays weak (0.167): it cannot use the transaction-ID
+  feature (constant in normal traffic), so it catches only the unused-register
+  injections.
+- The rule-based detector transfers well once its register map is set to the
+  plant (writes only to the actuator register; reused-txid replay): F1 0.909,
+  missing the same in-range actuator injections the SVM misses.
+
+The headline accuracy-vs-cost trade-off and the SVM's lead both hold on the
+higher-fidelity plant, which is the cross-check this item set out to provide.

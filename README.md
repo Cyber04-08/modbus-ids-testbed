@@ -40,7 +40,12 @@ time, memory).
   on the same 10 sessions (exported to pcap), in a separate sensor VM. Out of
   the box neither detects any attack; Suricata with our rules misses every
   replay (no memory of transaction IDs); Zeek with our script matches our
-  rule-based detector. See `docs/SETUP_LOG.md`. Next: GRFICSv2 replication,
+  rule-based detector. See `docs/SETUP_LOG.md`.
+- **Second half, item 4 (GRFICSv2 replication) - done.** Repeated the
+  comparison on the GRFICSv2 plant (real OpenPLC, process simulation, HMI,
+  firewall), captured passively from a sensor VM. The one-class SVM again
+  leads (F1 0.957, 0 false alarms); it misses only in-range writes to the
+  actuator register (a sender-identity case). See `docs/SETUP_LOG.md`. Next:
   varied and harder attacks.
 
 ## Quick start
