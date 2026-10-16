@@ -66,7 +66,7 @@ for another role.
 | Role | Produced by | File | Used for |
 |---|---|---|---|
 | Train | `testbed/capture_baseline.py` | `data/baseline_capture.csv` | Fitting the Isolation Forest (normal traffic only) |
-| Tune | `attacks/capture_tuning.py` | `data/tuning_labeled.csv` | Choosing the ML contamination (its attack fraction) |
+| Tune | `attacks/capture_tuning.py` | `data/tuning_labeled.csv` | Choosing the ML contamination (its attack fraction) and, for the tuned ML detector, its alert threshold (best F1 on this session) |
 | Test (x10) | `detectors/multi_run.py` (scenario + labeler per run) | `data/runs/run_XX.csv` | Final scoring only |
 
 The rule-based detector has no trained or tuned parameters: its rules come
@@ -84,7 +84,9 @@ sessions both ways:
 
 The leak made the ML detector look slightly better at catching attacks; it
 also shows the ML result is sensitive to this one setting, which is why
-threshold selection is a second-half work item. The rule-based detector is
+threshold selection was the first second-half work item (2026-10-15):
+the tuned ML detector sets its alert threshold at the best F1 on the
+tuning session instead, see `docs/SETUP_LOG.md`. The rule-based detector is
 unaffected (it has no tuned parameters).
 
 Limitation: every session runs the same attack sequence; only the benign

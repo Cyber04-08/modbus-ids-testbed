@@ -28,6 +28,11 @@ time, memory).
   cost/memory. See below.
 - **Multi-run statistics - done.** `detectors/multi_run.py` repeats the whole
   capture + evaluation 10 times and reports mean +/- 95% confidence intervals.
+- **Second half, item 1 (ML false alarms) - done.** Fixed a parsing bug that
+  zeroed every write value in the training data; added a tuned ML detector
+  whose alert threshold is chosen on the tuning session; measured how training
+  length affects it (`detectors/training_curve.py`). See `docs/SETUP_LOG.md`.
+  Next: one-class SVM, Zeek/Suricata, GRFICSv2 replication, varied attacks.
 
 ## Quick start
 
@@ -82,6 +87,8 @@ python attacks/capture_tuning.py              # tune session  -> data/tuning_lab
 python attacks/run_scenario.py && python data/label_dataset.py   # test session -> data/labeled.csv
 python detectors/evaluate.py                  # head-to-head comparison
 python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
+python testbed/capture_baseline.py 3600 data/baseline_60min.csv   # long normal session
+python detectors/training_curve.py            # ML quality vs training length
 ```
 
 - `detectors/features.py` - shared feature extraction (both detectors score
@@ -95,8 +102,11 @@ python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
   features are function code, register address/value, request size, and
   per-connection inter-arrival time; `contamination` is set to the attack
   fraction of the separate tuning session, not left at default and never
-  taken from the test set.
-- `detectors/evaluate.py` - runs both over the same test set and reports
+  taken from the test set. A second, *tuned* variant instead places its alert
+  threshold at the best F1 on that tuning session and fills each connection's
+  first (placeholder) inter-arrival with the median training gap; both are
+  reported side by side.
+- `detectors/evaluate.py` - runs all three over the same test set and reports
   precision/recall/F1/FPR, mean detection latency, and detector processing
   cost (per-request time + memory). Training and detection memory are
   measured in separate windows: the one-time training peak, the memory the
@@ -108,11 +118,14 @@ Result over 10 independent test sessions (750 scored requests, 140 attacks;
 mean +/- 95% CI): the rule-based detector reaches precision 1.00 with a 0
 false-positive rate at ~0.003 ms per request and ~3 KB while detecting, but
 misses *well-formed* malicious commands (recall 0.71, identical every run);
-the Isolation Forest reaches higher recall (0.87 +/- 0.02) and lower
-injection-detection latency (0.50 s vs 1.50 s), but at a 0.18 +/- 0.03
-false-positive rate and roughly 200x the processing time (~0.56 ms per
-request). Memory, split fairly: while detecting, the forest uses ~26 KB
-(vs ~3 KB) but must also keep its ~723 KB trained model in memory (the rules
-need under 1 KB); training is a separate one-time step (~2 s, ~747 KB peak).
+the Isolation Forest reaches higher recall (0.93) and lower
+injection-detection latency (0 s vs 1.50 s), but at a 0.18 +/- 0.04
+false-positive rate with the contamination cut-off (0.14 +/- 0.03 with the
+threshold tuned on the tuning session, precision 0.61) and roughly 200x the
+processing time (~0.58 ms per request). Memory, split fairly: while
+detecting, the forest uses ~26 KB (vs ~3 KB) but must also keep its ~720 KB
+trained model in memory (the rules need under 1 KB); training is a separate
+one-time step (~2 s, ~740 KB peak). (Figures updated 2026-10-15 after fixing
+a bug that zeroed write values in the training data; see `docs/SETUP_LOG.md`.)
 That accuracy-versus-processing-cost trade-off, measured head-to-head on
 unmodified Modbus/TCP, is the project's contribution.

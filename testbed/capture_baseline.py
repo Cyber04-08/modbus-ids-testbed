@@ -10,6 +10,7 @@ train/test leakage.
 Usage:
     python testbed/capture_baseline.py           # ~60s of normal traffic
     python testbed/capture_baseline.py 90        # custom duration (seconds)
+    python testbed/capture_baseline.py 3600 data/baseline_60min.csv   # custom output
 """
 
 import socket
@@ -37,6 +38,7 @@ def wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
 
 def main() -> None:
     duration = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
+    out_csv = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else BASELINE_CSV
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     procs = {}
     try:
@@ -44,11 +46,11 @@ def main() -> None:
         if not wait_for_port("127.0.0.1", 5020):
             raise SystemExit("PLC simulator did not come up on :5020")
         procs["tap"] = subprocess.Popen([PY, str(ROOT / "testbed" / "modbus_tap.py"),
-                                         str(BASELINE_CSV)])
+                                         str(out_csv)])
         if not wait_for_port("127.0.0.1", 5021):
             raise SystemExit("Capture tap did not come up on :5021")
 
-        print(f"[baseline] capturing {duration:.0f}s of normal traffic -> {BASELINE_CSV}")
+        print(f"[baseline] capturing {duration:.0f}s of normal traffic -> {out_csv}")
         procs["hmi"] = subprocess.Popen([PY, str(ROOT / "testbed" / "hmi_client.py"),
                                          str(duration)])
         time.sleep(duration + 2)
@@ -61,9 +63,9 @@ def main() -> None:
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     p.kill()
-        if BASELINE_CSV.exists():
-            rows = sum(1 for _ in open(BASELINE_CSV)) - 1
-            print(f"[baseline] done: {rows} frames -> {BASELINE_CSV}")
+        if out_csv.exists():
+            rows = sum(1 for _ in open(out_csv)) - 1
+            print(f"[baseline] done: {rows} frames -> {out_csv}")
 
 
 if __name__ == "__main__":

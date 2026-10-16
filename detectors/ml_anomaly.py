@@ -35,6 +35,17 @@ as anomalous. That is why its false-positive rate (~0.18) tracks the
 contamination value, and why lowering it trades recall for fewer false
 alarms.
 
+Second-half change - choosing the cut-off from labeled tuning traffic
+instead (calibrate(), the "tuned" detector in evaluate.py): the forest is
+still trained on normal traffic only, but the alert threshold is then placed
+where it gives the best F1 on the separate tuning session, which contains
+both normal requests and attacks. The threshold is a point on the score
+scale, not a share of training traffic, so the false-alarm rate no longer
+equals whatever percentage was asked for. The tuned detector also replaces
+the placeholder 0 s inter-arrival of each connection's first request with
+the median gap seen in training (fill_first_gap). The original
+contamination detector is kept unchanged for comparison.
+
 Chosen over one-class SVM as the primary model for speed and its native
 handling of the benign/attack imbalance via `contamination`.
 
@@ -55,7 +66,8 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from features import build_feature_matrix, load_requests  # noqa: E402
+from features import (ML_FEATURE_COLUMNS, build_feature_matrix,  # noqa: E402
+                      load_requests)
 
 DEFAULT_CONTAMINATION = 0.1   # expected outlier fraction; tune to the data
 RANDOM_STATE = 42
@@ -63,8 +75,11 @@ RANDOM_STATE = 42
 
 class MLAnomalyDetector:
     def __init__(self, contamination: float = DEFAULT_CONTAMINATION,
-                 random_state: int = RANDOM_STATE):
+                 random_state: int = RANDOM_STATE, fill_first_gap: bool = False):
         self.contamination = contamination
+        self.fill_first_gap = fill_first_gap
+        self.gap_fill_ = 0.0       # learned in fit() when fill_first_gap is on
+        self.threshold_ = None     # set by calibrate(); None = use contamination
         self.scaler = StandardScaler()
         self.model = IsolationForest(
             n_estimators=200,
@@ -72,19 +87,56 @@ class MLAnomalyDetector:
             random_state=random_state,
         )
 
+    def _features(self, df) -> np.ndarray:
+        X = build_feature_matrix(df)
+        if self.fill_first_gap and "first_on_connection" in df.columns:
+            col = ML_FEATURE_COLUMNS.index("inter_arrival")
+            X[df["first_on_connection"].to_numpy(), col] = self.gap_fill_
+        return X
+
     def fit(self, benign_df) -> "MLAnomalyDetector":
         """Fit on benign-only traffic. Any attack rows present are ignored, so
         this stays true to 'trained on normal traffic only' even if a labeled
         file is passed in."""
         if "is_attack" in benign_df.columns:
             benign_df = benign_df[benign_df["is_attack"] == 0]
-        X = self.scaler.fit_transform(build_feature_matrix(benign_df))
+        if self.fill_first_gap:
+            real_gaps = benign_df.loc[~benign_df["first_on_connection"], "inter_arrival"]
+            self.gap_fill_ = float(real_gaps.median())
+        X = self.scaler.fit_transform(self._features(benign_df))
         self.model.fit(X)
+        return self
+
+    def score(self, df) -> np.ndarray:
+        """Anomaly score per request: higher = easier to isolate = more unusual."""
+        return -self.model.score_samples(self.scaler.transform(self._features(df)))
+
+    def calibrate(self, tune_df) -> "MLAnomalyDetector":
+        """Place the alert threshold at the score that gives the best F1 on the
+        labeled TUNING session (ties -> fewer false alarms). Only that
+        session's labels are used; test labels never are."""
+        if "scored" in tune_df.columns:
+            tune_df = tune_df[tune_df["scored"]]
+        scores = self.score(tune_df)
+        y = tune_df["is_attack"].to_numpy()
+        best = None
+        for t in np.unique(scores):
+            pred = scores >= t
+            tp = int((pred & (y == 1)).sum())
+            fp = int((pred & (y == 0)).sum())
+            fn = int((~pred & (y == 1)).sum())
+            f1 = 2 * tp / (2 * tp + fp + fn) if tp else 0.0
+            key = (f1, -fp)
+            if best is None or key > best[0]:
+                best = (key, float(t))
+        self.threshold_ = best[1]
         return self
 
     def predict(self, df) -> np.ndarray:
         """Return 1 for anomaly (attack), 0 for normal."""
-        X = self.scaler.transform(build_feature_matrix(df))
+        if self.threshold_ is not None:
+            return (self.score(df) >= self.threshold_).astype(int)
+        X = self.scaler.transform(self._features(df))
         # IsolationForest: -1 = outlier, 1 = inlier -> map to 1/0.
         return (self.model.predict(X) == -1).astype(int)
 

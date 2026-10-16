@@ -491,3 +491,87 @@ Previous results kept in `data/v2_before_memory_split/`.
 
 Per-request time is lower than the earlier 0.80 ms figure; timing varies with
 machine load, the ~200x ratio holds.
+
+## 2026-10-15 - Second half, item 1: reducing the ML detector's false alarms
+
+### Bug found: training write values were all read as 0
+
+`features.load_requests()` read the `values` column with pandas' type
+guessing. Test and tuning sessions contain one multi-value FC16 write
+(`"999 ..."`), so the column stayed text and parsed correctly. The normal-only
+training session never sends FC16, so pandas read the column as numbers and
+`_first_value()` (which only parses text) turned every training write value
+into 0. The Isolation Forest was therefore trained on setpoint and valve
+writes that all had value 0, then tested on real values. The rule-based
+detector only reads test files and was not affected.
+
+Fix: `pd.read_csv(..., dtype={"values": str})`. Re-scoring the same 10 saved
+runs (previous results kept in `data/v3_before_value_fix/`):
+
+| ML (contamination 0.177) | precision | recall | FPR |
+|---|---|---|---|
+| before the fix (Midterm / A4 figures) | 0.531 | 0.871 | 0.182 |
+| after the fix | 0.549 | 0.929 | 0.182 |
+
+### Tuned ML detector (threshold from the tuning session)
+
+The contamination cut-off flags a fixed share (17.7%) of the *normal-only*
+training data, so the false-positive rate tracks that number by design. New
+variant `ml-tuned` (kept alongside the original in `evaluate.py` and
+`multi_run.py`):
+- `MLAnomalyDetector.calibrate(tune_df)`: alert threshold = the anomaly score
+  with the best F1 on the separate labeled tuning session (ties go to fewer
+  false alarms). Test labels are still never used.
+- `fill_first_gap`: the first request on each connection has no predecessor,
+  so its inter-arrival was a placeholder 0; it is replaced by the median gap
+  seen in training (`features.py` now marks `first_on_connection`).
+
+10 saved runs, 60 s training session (`python detectors/multi_run.py --reuse`,
+idle machine):
+
+| mean +/- 95% CI | rule-based | ML (contamination) | ML (tuned) |
+|---|---|---|---|
+| precision | 1.000 | 0.549 +/- 0.064 | 0.614 +/- 0.058 |
+| recall | 0.714 | 0.929 | 0.929 |
+| F1 | 0.833 | 0.686 +/- 0.048 | 0.736 +/- 0.042 |
+| FPR | 0.000 | 0.182 +/- 0.037 | 0.139 +/- 0.032 |
+| detection ms/request | 0.0026 | 0.588 | 0.577 |
+| model held | 0.3 KB | 717 KB | 735 KB |
+| training (one-time) | 0 | 2.0 s | 2.1 s |
+
+### Does more training data help? (`detectors/training_curve.py`)
+
+Recorded one 60-minute normal-only session (`python testbed/capture_baseline.py
+3600 data/baseline_60min.csv`; the script now takes an optional output path)
+and trained on its first 1-60 minutes, scoring the same 10 runs (pooled):
+
+| minutes | train requests | FPR contamination | FPR tuned | tuned precision / recall |
+|---|---|---|---|---|
+| 1 | 73 | 0.287 | 0.184 | 0.527 / 0.893 |
+| 2 | 163 | 0.257 | 0.220 | 0.498 / 0.950 |
+| 5 | 414 | 0.266 | 0.059 | 0.769 / 0.857 |
+| 10 | 830 | 0.248 | 0.107 | 0.668 / 0.936 |
+| 20 | 1656 | 0.275 | 0.179 | 0.546 / 0.936 |
+| 30 | 2474 | 0.285 | 0.208 | 0.510 / 0.943 |
+| 45 | 3710 | 0.300 | 0.220 | 0.498 / 0.950 |
+| 60 | 4939 | 0.300 | 0.220 | 0.498 / 0.950 |
+
+The tuned threshold beats the contamination cut-off at every length, but more
+training data does not steadily help. Two label-free feature changes were also
+tried (coil values normalized to 0/1; a one-hot "command type" per function
+code + address) and did not fix this either (best: 0.079 at 10 min, 0.195 at
+60 min). Not adopted; the official training session stays at 60 s.
+
+Why: replays are 8 of the 14 attacks per session, and each is a byte-exact
+copy of a normal setpoint write. Per request, the only clue left in these
+features is a 0.4 s gap, so the threshold has to reach into normal traffic to
+catch them, and the more normal traffic the forest learns, the more ordinary
+that gap looks. The real replay signature (a reused transaction ID) needs
+memory of earlier requests; it is constant in normal traffic (always +1), and
+an Isolation Forest cannot split on a feature that never varies in training.
+This motivates the one-class SVM (distance-based) as the next item.
+
+Caveat: the threshold is set on one tuning session of 79 scored requests (14
+attacks) whose attack sequence is the same as the test sessions', so the tuned
+numbers are likely optimistic and the chosen point is coarse (wide per-run FPR
+ranges). Varied attacks are a later item.

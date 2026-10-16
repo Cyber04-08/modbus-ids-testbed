@@ -18,7 +18,9 @@ test traffic and reports, for each, exactly the metrics the proposal commits to:
 Three independent capture sessions, never mixed (no train/tune/test leakage):
   * train = data/baseline_capture.csv  (normal only; the ML model fits on this)
   * tune  = data/tuning_labeled.csv    (its own labeled scenario session; the
-                                        ML contamination is set from it)
+                                        ML contamination, and the tuned ML
+                                        detector's alert threshold, are set
+                                        from it)
   * test  = data/labeled.csv           (benign + replay + injection; used only
                                         for final scoring, its labels are never
                                         used to configure a detector)
@@ -143,13 +145,21 @@ def eval_rule_based(train_df, test_df):
     }
 
 
-def eval_ml(train_df, test_df, contamination, random_state=None):
+def eval_ml(train_df, test_df, contamination, random_state=None, tune_df=None):
+    """ML detector. With tune_df, the tuned variant: first-gap fill plus an
+    alert threshold calibrated on that tuning session (counted as training)."""
     kw = {} if random_state is None else {"random_state": random_state}
-    _warm_up("ml", lambda: MLAnomalyDetector(contamination=contamination, **kw)
-             .fit(train_df).predict(test_df.head(5)))
+    tuned = tune_df is not None
+
+    def build():
+        det = MLAnomalyDetector(contamination=contamination, fill_first_gap=tuned,
+                                **kw).fit(train_df)
+        return det.calibrate(tune_df) if tuned else det
+
+    _warm_up("ml-tuned" if tuned else "ml", lambda: build().predict(test_df.head(5)))
     tracemalloc.start()
     t0 = time.perf_counter()
-    det = MLAnomalyDetector(contamination=contamination, **kw).fit(train_df)
+    det = build()
     train_ms = 1000 * (time.perf_counter() - t0)
     model_bytes, train_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -219,23 +229,30 @@ def main() -> None:
     ml_pred, ml_cost = eval_ml(train_df, test_df, contamination)
     ml_q = quality_metrics(y, ml_pred[mask])
     ml_lat = detection_latency(test_df, ml_pred)
-    print_report("ML anomaly detector (Isolation Forest)", ml_q, ml_cost, ml_lat)
+    print_report("ML anomaly detector (Isolation Forest, contamination cut-off)",
+                 ml_q, ml_cost, ml_lat)
+
+    mt_pred, mt_cost = eval_ml(train_df, test_df, contamination, tune_df=tune_df)
+    mt_q = quality_metrics(y, mt_pred[mask])
+    mt_lat = detection_latency(test_df, mt_pred)
+    print_report("ML anomaly detector (Isolation Forest, threshold tuned on tuning session)",
+                 mt_q, mt_cost, mt_lat)
 
     # Compact side-by-side for the report.
     print("\n=== side-by-side ===")
-    hdr = f"{'metric':<18}{'rule-based':>14}{'ML (iForest)':>16}"
+    hdr = f"{'metric':<18}{'rule-based':>14}{'ML (iForest)':>16}{'ML (tuned)':>14}"
     print(hdr)
     print("-" * len(hdr))
     for key, label in [("precision", "precision"), ("recall", "recall"),
                        ("f1", "F1"), ("fpr", "false-pos rate"),
                        ("accuracy", "accuracy")]:
-        print(f"{label:<18}{rb_q[key]:>14.3f}{ml_q[key]:>16.3f}")
-    print(f"{'ms/request':<18}{rb_cost['per_request_ms']:>14.4f}"
-          f"{ml_cost['per_request_ms']:>16.4f}")
-    print(f"{'detect peak KB':<18}{rb_cost['peak_kb']:>14.0f}{ml_cost['peak_kb']:>16.0f}")
-    print(f"{'model held KB':<18}{rb_cost['model_kb']:>14.0f}{ml_cost['model_kb']:>16.0f}")
-    print(f"{'train peak KB':<18}{rb_cost['train_peak_kb']:>14.0f}{ml_cost['train_peak_kb']:>16.0f}")
-    print(f"{'train ms':<18}{rb_cost['train_ms']:>14.1f}{ml_cost['train_ms']:>16.1f}")
+        print(f"{label:<18}{rb_q[key]:>14.3f}{ml_q[key]:>16.3f}{mt_q[key]:>14.3f}")
+    for key, label, fmt in [("per_request_ms", "ms/request", ".4f"),
+                            ("peak_kb", "detect peak KB", ".0f"),
+                            ("model_kb", "model held KB", ".0f"),
+                            ("train_peak_kb", "train peak KB", ".0f"),
+                            ("train_ms", "train ms", ".1f")]:
+        print(f"{label:<18}{rb_cost[key]:>14{fmt}}{ml_cost[key]:>16{fmt}}{mt_cost[key]:>14{fmt}}")
 
 
 if __name__ == "__main__":

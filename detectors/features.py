@@ -40,7 +40,11 @@ def _first_value(values_field: str) -> float:
 def load_requests(csv_path: str) -> pd.DataFrame:
     """Load a capture/labeled CSV and return only request frames, typed and
     time-sorted, with derived per-connection features."""
-    df = pd.read_csv(csv_path)
+    # `values` must be read as text. A capture whose writes are all single
+    # values (e.g. the normal-only training session, which never sends FC16)
+    # would otherwise be parsed as numbers, and _first_value would turn every
+    # written value into 0 - the model would train on writes it never sees.
+    df = pd.read_csv(csv_path, dtype={"values": str})
     df = df[df["direction"] == "req"].copy()
 
     # Numeric coercions; reads leave address/count/value blank -> 0.
@@ -52,10 +56,13 @@ def load_requests(csv_path: str) -> pd.DataFrame:
     df = df.sort_values("wall_time").reset_index(drop=True)
 
     # Inter-arrival time within each TCP connection (client_port). The first
-    # request on a connection has no predecessor -> 0.
+    # request on a connection has no predecessor -> 0, and is marked so the
+    # ML detector can replace that placeholder, which is not a measured gap
+    # (left in, it made each session's first request look unusual).
     df["inter_arrival"] = (
         df.groupby("client_port")["wall_time"].diff().fillna(0.0)
     )
+    df["first_on_connection"] = df.groupby("client_port").cumcount() == 0
 
     if "is_attack" in df.columns:
         # A blank is_attack marks a request the detectors still see (it is part

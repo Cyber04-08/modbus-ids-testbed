@@ -19,8 +19,9 @@ Three kinds of independent capture session, never mixed:
             model fits on it, mirroring deployment (train once, then face many
             unseen traffic windows)
     tune  - data/tuning_labeled.csv, its own labeled scenario session (made by
-            attacks/capture_tuning.py if missing); the ML contamination is set
-            from it, never from a test run
+            attacks/capture_tuning.py if missing); the ML contamination and
+            the tuned ML detector's alert threshold are set from it, never
+            from a test run
     test  - one fresh scenario session per run, used only for scoring
 Only scored requests are graded (PLC responses and the replay's seed packet
 stay in the stream the detectors see but are not graded).
@@ -65,6 +66,8 @@ METRICS = ["precision", "recall", "f1", "fpr", "accuracy",
            "latency_replay_s", "latency_injection_s",
            "per_request_ms", "peak_kb", "model_kb", "train_peak_kb", "train_ms"]
 
+DETECTORS = ("rule-based", "ml-iforest", "ml-tuned")
+
 # Two-sided 95% Student-t critical values by degrees of freedom (n - 1).
 T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
        7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179,
@@ -88,7 +91,8 @@ def capture_run(i: int, quick: bool) -> Path:
     return out
 
 
-def score_run(train_df, test_csv: Path, seed: int, contamination: float) -> list[dict]:
+def score_run(train_df, tune_df, test_csv: Path, seed: int,
+              contamination: float) -> list[dict]:
     test_df = load_requests(str(test_csv))
     mask = scored_mask(test_df)
     y = test_df["is_attack"].to_numpy()[mask]
@@ -97,6 +101,8 @@ def score_run(train_df, test_csv: Path, seed: int, contamination: float) -> list
     for name, (pred, cost) in (
         ("rule-based", eval_rule_based(train_df, test_df)),
         ("ml-iforest", eval_ml(train_df, test_df, contamination, random_state=seed)),
+        ("ml-tuned", eval_ml(train_df, test_df, contamination, random_state=seed,
+                             tune_df=tune_df)),
     ):
         q = quality_metrics(y, pred[mask])
         lat = detection_latency(test_df, pred)
@@ -119,7 +125,7 @@ def score_run(train_df, test_csv: Path, seed: int, contamination: float) -> list
 
 def summarize(results: list[dict]) -> list[dict]:
     summary = []
-    for det in ("rule-based", "ml-iforest"):
+    for det in DETECTORS:
         dr = [r for r in results if r["detector"] == det]
         for m in METRICS:
             vals = np.array([r[m] for r in dr if r[m] is not None], dtype=float)
@@ -162,7 +168,8 @@ def main() -> None:
         print("[multi-run] no tuning session yet - capturing one...", flush=True)
         subprocess.run([PY, str(ROOT / "attacks" / "capture_tuning.py")], check=True,
                        cwd=ROOT, stdout=subprocess.DEVNULL)
-    contamination = contamination_from(load_requests(str(TUNE_CSV)))
+    tune_df = load_requests(str(TUNE_CSV))
+    contamination = contamination_from(tune_df)
 
     if reuse:
         run_files = sorted(RUNS_DIR.glob("run_*.csv"))
@@ -176,7 +183,7 @@ def main() -> None:
 
     results = []
     for seed, f in enumerate(run_files):
-        results.extend(score_run(train_df, f, seed, contamination))
+        results.extend(score_run(train_df, tune_df, f, seed, contamination))
     write_csv(RESULTS_CSV, results)
     summary = summarize(results)
     write_csv(SUMMARY_CSV, summary)
@@ -184,12 +191,12 @@ def main() -> None:
     print(f"\nModbus/TCP IDS - {len(run_files)}-run comparison "
           f"(train: {len(train_df)} benign requests; ML contamination "
           f"{contamination:.3f} from the tuning session)")
-    print(f"{'metric':<22}{'rule-based':>26}{'ML (iForest)':>26}")
-    print("-" * 74)
+    print(f"{'metric':<22}{'rule-based':>24}{'ML (iForest)':>24}{'ML (tuned)':>24}")
+    print("-" * 94)
     by = {(s["detector"], s["metric"]): s for s in summary}
     for m in METRICS:
         cells = []
-        for det in ("rule-based", "ml-iforest"):
+        for det in DETECTORS:
             s = by[(det, m)]
             fmt = (".4f" if m == "per_request_ms" else
                    ".0f" if m in ("peak_kb", "model_kb", "train_peak_kb") else
@@ -198,10 +205,9 @@ def main() -> None:
             if s["missed"]:
                 cell += f" ({s['missed']} missed)"
             cells.append(cell)
-        print(f"{m:<22}{cells[0]:>26}{cells[1]:>26}")
+        print(f"{m:<22}" + "".join(f"{c:>24}" for c in cells))
     for m in ("pooled_precision", "pooled_recall", "pooled_fpr"):
-        print(f"{m:<22}{by[('rule-based', m)]['mean']:>26.3f}"
-              f"{by[('ml-iforest', m)]['mean']:>26.3f}")
+        print(f"{m:<22}" + "".join(f"{by[(d, m)]['mean']:>24.3f}" for d in DETECTORS))
     print("\n(± is the 95% confidence half-width over runs; peak_kb is detection only,\n"
           " train_peak_kb / train_ms are the one-time training step, model_kb is what\n"
           " the built detector keeps in memory while detecting)")
