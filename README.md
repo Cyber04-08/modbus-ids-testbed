@@ -35,7 +35,12 @@ time, memory).
 - **Second half, item 2 (one-class SVM) - done.** `detectors/ocsvm.py`, with
   a transaction-ID-change feature the forest cannot use. Over the 10 runs it
   matches the rules' zero false alarms and catches more attacks (F1 0.96 vs
-  0.83), at ~0.03 ms per request. Next: Zeek/Suricata, GRFICSv2 replication,
+  0.83), at ~0.03 ms per request.
+- **Second half, item 3 (off-the-shelf NIDS) - done.** Suricata 8 and Zeek 9
+  on the same 10 sessions (exported to pcap), in a separate sensor VM. Out of
+  the box neither detects any attack; Suricata with our rules misses every
+  replay (no memory of transaction IDs); Zeek with our script matches our
+  rule-based detector. See `docs/SETUP_LOG.md`. Next: GRFICSv2 replication,
   varied and harder attacks.
 
 ## Quick start
@@ -93,6 +98,9 @@ python detectors/evaluate.py                  # head-to-head comparison
 python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
 python testbed/capture_baseline.py 3600 data/baseline_60min.csv   # long normal session
 python detectors/training_curve.py            # ML quality vs training length
+python tools/export_pcap.py --all data/pcap    # sessions -> pcap for Suricata/Zeek
+# inside the sensor VM: sudo sh tools/setup_sensor.sh; bash tools/nids/run_nids.sh
+python detectors/nids_compare.py              # score Suricata/Zeek like our detectors
 ```
 
 - `detectors/features.py` - shared feature extraction (both detectors score

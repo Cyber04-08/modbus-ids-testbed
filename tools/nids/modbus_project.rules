@@ -1,0 +1,42 @@
+# Suricata rules - this project's rule-based detector (detectors/rule_based.py)
+# rewritten in Suricata's Modbus keyword language, for the water-tank testbed.
+# Register map: HR0 = tank level (sensor, read-only), HR1 = pump setpoint (%),
+# coil 0 = inlet valve, coil 1 = outlet valve.
+#
+# What Suricata rules can express: per-request checks on function code,
+# address and value. What they cannot: the replay check (a write that reuses
+# an earlier transaction ID with the same bytes) needs memory of earlier
+# requests on the connection - see modbus_project.zeek for that.
+# Requires the Modbus parser: --set app-layer.protocols.modbus.enabled=yes
+#
+# Address numbering: Suricata's `address` is 1-based - protocol address 0
+# (HR0) is `address 1`, HR1 is `address 2`, coil 1 is `address 2` - and a
+# range `>N` is strict on that 1-based number. Found by probing Suricata 8.0.7
+# with hand-built writes to addresses 0-3 (first version of these rules used
+# 0-based numbers and fired on normal setpoint writes).
+
+# 1. function_code_not_allowed - public function codes this plant never uses
+#    (it only uses FC1, 3, 5, 6, 16).
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC2)"; modbus: function 2; sid:9100002; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC4)"; modbus: function 4; sid:9100004; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC7)"; modbus: function 7; sid:9100007; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC8)"; modbus: function 8; sid:9100008; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC11)"; modbus: function 11; sid:9100011; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC12)"; modbus: function 12; sid:9100012; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC15)"; modbus: function 15; sid:9100015; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC17)"; modbus: function 17; sid:9100017; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC20)"; modbus: function 20; sid:9100020; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC21)"; modbus: function 21; sid:9100021; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC22)"; modbus: function 22; sid:9100022; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC23)"; modbus: function 23; sid:9100023; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC24)"; modbus: function 24; sid:9100024; rev:1;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT function code not allowed (FC43)"; modbus: function 43; sid:9100043; rev:1;)
+
+# 2. write_to_readonly_address - HR0 (tank level) is a sensor; coils above 1
+#    do not exist in this plant.
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT write to read-only register HR0 (tank level)"; modbus: access write holding, address 1; sid:9100100; rev:2;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT write to holding register above HR1"; modbus: access write holding, address >2; sid:9100101; rev:2;)
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT write to coil above 1"; modbus: access write coils, address >2; sid:9100102; rev:2;)
+
+# 3. value_out_of_range - pump setpoint must be 0-100 %.
+alert modbus any any -> any 502 (msg:"MODBUS-PROJECT pump setpoint out of range (>100)"; modbus: access write holding, address 2, value >100; sid:9100200; rev:2;)

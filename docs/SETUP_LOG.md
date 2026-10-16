@@ -638,3 +638,76 @@ same 60-minute capture, 10 runs pooled): the one-class SVM has precision
 1.000 and FPR 0.000 at every length from 1 to 60 minutes (recall 0.950 at
 1 min, 0.929 from 2 min on). Training time grows from 13 ms to 78 ms and the
 model from 10 KB to 23 KB; the forests stay at ~2 s and ~1 MB.
+
+## 2026-10-15/16 - Second half, item 3: off-the-shelf NIDS (Suricata, Zeek)
+
+### Setup
+
+- Sensor VM `ids-sensor` (VirtualBox, `C:\Users\nwane\VirtualBox VMs\ids-sensor`):
+  a fresh import of the Kali 2026.2 image with a new disk UUID, separate from
+  every other VM; snapshot `fresh-import` = unmodified image. The repo is
+  shared into it at `/media/sf_ids`. Installed with `tools/setup_sensor.sh`:
+  Suricata 8.0.7, Zeek 9.0.0 (Zeek project repository; Kali's 5.1.1 package
+  cannot install on Kali 2026.2), tshark 4.6.6, ET Open ruleset (69,163
+  rules, 53,203 enabled). The install upgrades systemd, which stops the
+  VirtualBox guest service until a reboot.
+- `tools/export_pcap.py` turns each saved session CSV into a pcap: the
+  captured Modbus bytes and timestamps unchanged, TCP/IP rebuilt around them
+  (handshake, sequence numbers, FIN), one client IP for all clients (as on
+  the loopback testbed), PLC on port 502. tshark reports no errors on them.
+  Known artifact: Zeek logs `FIN_advanced_last_seq` on ~2 connection
+  teardowns per run (rebuilt TCP close, not Modbus); not counted.
+- `tools/nids/run_nids.sh` runs four configurations on all 12 pcaps:
+  suricata-stock (ET Open + Suricata's `modbus-events.rules`), suricata-project
+  (`tools/nids/modbus_project.rules`, our rules in Suricata syntax),
+  zeek-stock (default scripts), zeek-project (`tools/nids/modbus_project.zeek`,
+  our rules incl. the replay check). Suricata's Modbus parser is off by
+  default and is enabled for both Suricata runs.
+- `detectors/nids_compare.py` maps alerts to requests and scores them like
+  our detectors (same 10 test runs, same ground truth).
+
+### Pitfalls found (and fixed)
+
+1. Suricata Modbus `address` numbers are 1-based (protocol address 0 = rule
+   `address 1`) and `>N` is strict on that number. Found by probing with
+   hand-built writes to addresses 0-3. The first, 0-based rule version fired
+   on normal setpoint writes (148 false alarms over 10 runs).
+2. Suricata stamps an alert with the time of the packet that triggered
+   inspection, which can be a later packet than the request (e.g. the next
+   poll). Alerts are therefore mapped by Suricata's per-flow `tx_id`
+   (n-th request on the connection), cross-checked against the logged Modbus
+   transaction ID: 0 mismatches.
+3. Stock rule "SURICATA Modbus Data mismatch" fires on every FC3 read
+   *response* (478 alerts over the 10 runs, ~48 per run, also on the
+   normal-only training session), including on a hand-built minimal exchange
+   with spec-compliant byte counts for 1, 2 and 3 registers. tshark and Zeek
+   report nothing wrong with those responses. They are on PLC responses, so
+   they are not graded, but an operator would see them as alert noise.
+
+### Results (10 test runs, pooled; 140 attack requests, 610 benign)
+
+| detector | precision | recall | F1 | FPR | s per run |
+|---|---|---|---|---|---|
+| Suricata, stock (ET Open + modbus-events) | - | 0.000 | 0.000 | 0.000 | 101 (rule loading) |
+| Zeek, stock | - | 0.000 | 0.000 | 0.000 | 2.9 |
+| Suricata + our rules | 1.000 | 0.143 | 0.250 | 0.000 | 0.9 |
+| Zeek + our script | 1.000 | 0.714 | 0.833 | 0.000 | 2.1 |
+| ours: rule-based (Python) | 1.000 | 0.714 | 0.833 | 0.000 | |
+| ours: Isolation Forest (tuned) | 0.605 | 0.929 | 0.732 | 0.139 | |
+| ours: one-class SVM | 1.000 | 0.929 | 0.963 | 0.000 | |
+
+Reading:
+- Out of the box, neither tool detects any attack. Of 53,203 enabled ET Open
+  rules, one mentions Modbus (an exploit for one product); nothing checks
+  which registers are written or whether a request is a replay. Zeek's
+  default scripts log every Modbus request (`modbus.log`) but raise nothing.
+- Suricata with our rules catches only the 2 injections that break a
+  per-request rule (FC16 write to HR0, setpoint 60000): signature rules
+  cannot remember earlier transaction IDs, so all 8 replays per run pass.
+- Zeek with our script reproduces the Python rule-based detector exactly
+  (same 100 TP, 0 FP): the replay check needs per-connection state, which a
+  Zeek script can keep.
+- The one-class SVM remains the best detector on this traffic.
+- "s per run" is a whole tool run on one ~45 s session including start-up;
+  stock Suricata spends most of its 101 s loading 53k rules, which a live
+  sensor does once. Not comparable to the per-request times of our detectors.
