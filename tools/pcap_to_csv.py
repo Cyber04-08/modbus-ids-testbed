@@ -18,8 +18,12 @@ capture order before splitting it into Modbus frames (a frame can span two
 segments, and a segment can hold several frames - the live tap handled the
 same thing). Linux cooked and Ethernet link types are both handled.
 
+Only TCP traffic to or from the Modbus port (502 unless --port is given) is
+converted. Everything skipped is counted by reason and printed, so a capture
+that lost data, or used another port, cannot silently produce a short CSV.
+
 Usage:
-    python tools/pcap_to_csv.py in.pcap out.csv
+    python tools/pcap_to_csv.py in.pcap out.csv [--port 502]
 """
 
 from __future__ import annotations
@@ -27,10 +31,13 @@ from __future__ import annotations
 import csv
 import struct
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "testbed"))
-from modbus_tap import decode_pdu, iter_frames  # noqa: E402
+from modbus_tap import frame_row, iter_frames  # noqa: E402
+
+MODBUS_PORT = 502
 
 CSV_FIELDS = [
     "wall_time", "monotonic", "direction", "client_port",
@@ -45,8 +52,10 @@ LINKTYPE_LINUX_SLL = 113
 LINKTYPE_LINUX_SLL2 = 276
 
 
-def _read_pcap(path: Path):
-    """Yield (ts, link_bytes) for each record in a classic .pcap file."""
+def _read_pcap(path: Path, skipped: Counter):
+    """Yield (ts, linktype, link_bytes) for each record in a classic .pcap
+    file, counting records cut short by the snapshot length or by the file
+    ending mid-record."""
     data = path.read_bytes()
     magic = data[:4]
     if magic in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4"):
@@ -58,33 +67,47 @@ def _read_pcap(path: Path):
     linktype = struct.unpack(end + "I", data[20:24])[0]
     off, n = 24, len(data)
     while off + 16 <= n:
-        ts_sec, ts_usec, caplen, _ = struct.unpack(end + "IIII", data[off:off + 16])
+        ts_sec, ts_usec, caplen, orig_len = struct.unpack(end + "IIII", data[off:off + 16])
         off += 16
+        if off + caplen > n:
+            skipped["record cut off at end of file"] += 1
+            break
+        if caplen < orig_len:
+            skipped["packet truncated by snapshot length (kept, may lose bytes)"] += 1
         yield ts_sec + ts_usec / 1e6, linktype, data[off:off + caplen]
         off += caplen
+    if 0 < n - off < 16:
+        skipped["record cut off at end of file"] += 1
 
 
 def _parse_l3(linktype: int, pkt: bytes):
-    """Strip the link layer; return the IPv4 payload (proto, src, dst, l4) or None."""
+    """Strip the link layer; return (src, dst, tcp_segment), or a string
+    naming why the packet is not an IPv4 TCP packet we can read."""
     if linktype == LINKTYPE_ETHERNET:
-        if len(pkt) < 14 or pkt[12:14] != b"\x08\x00":
-            return None
-        ip = pkt[14:]
+        if len(pkt) < 14:
+            return "short link header"
+        ethertype, ip = pkt[12:14], pkt[14:]
+        if ethertype == b"\x81\x00" and len(pkt) >= 18:     # one 802.1Q VLAN tag
+            ethertype, ip = pkt[16:18], pkt[18:]
     elif linktype == LINKTYPE_LINUX_SLL:
-        if len(pkt) < 16 or pkt[14:16] != b"\x08\x00":
-            return None
-        ip = pkt[16:]
+        if len(pkt) < 16:
+            return "short link header"
+        ethertype, ip = pkt[14:16], pkt[16:]
     elif linktype == LINKTYPE_LINUX_SLL2:
-        if len(pkt) < 20 or pkt[0:2] != b"\x08\x00":
-            return None
-        ip = pkt[20:]
+        if len(pkt) < 20:
+            return "short link header"
+        ethertype, ip = pkt[0:2], pkt[20:]
     else:
-        return None
+        return f"unsupported link type {linktype}"
+    if ethertype != b"\x08\x00":
+        return "not IPv4 (e.g. ARP, IPv6)"
     if len(ip) < 20 or (ip[0] >> 4) != 4:
-        return None
+        return "bad IPv4 header"
+    if ip[9] != 6:
+        return "not TCP"
+    if struct.unpack(">H", ip[6:8])[0] & 0x3FFF:          # MF flag or fragment offset
+        return "IP fragment (not reassembled)"
     ihl = (ip[0] & 0x0F) * 4
-    if ip[9] != 6:                       # not TCP
-        return None
     src = ".".join(str(b) for b in ip[12:16])
     dst = ".".join(str(b) for b in ip[16:20])
     total_len = struct.unpack(">H", ip[2:4])[0]
@@ -100,72 +123,97 @@ def _parse_tcp(seg: bytes):
     return src_port, dst_port, seq, seg[data_off:]
 
 
-def convert(pcap_path: Path, csv_path: Path) -> int:
+def _seq_diff(a: int, b: int) -> int:
+    """a - b in 32-bit TCP sequence space, as a signed number."""
+    d = (a - b) & 0xFFFFFFFF
+    return d - 0x100000000 if d >= 0x80000000 else d
+
+
+def convert(pcap_path: Path, csv_path: Path, port: int = MODBUS_PORT,
+            skipped: Counter | None = None) -> int:
     # Reassemble each TCP stream in sequence-number order, skipping
     # retransmitted / already-seen bytes (a real capture, unlike the live
     # proxy tap, contains TCP retransmissions; counting them would duplicate
     # Modbus frames).
+    skipped = Counter() if skipped is None else skipped
     streams: dict[tuple, dict] = {}
     records = []
-    for ts, linktype, pkt in _read_pcap(pcap_path):
+    for ts, linktype, pkt in _read_pcap(pcap_path, skipped):
         l3 = _parse_l3(linktype, pkt)
-        if not l3:
+        if isinstance(l3, str):
+            skipped[l3] += 1
             continue
         src, dst, seg = l3
         tcp = _parse_tcp(seg)
-        if not tcp or not tcp[3]:
+        if not tcp:
+            skipped["bad TCP header"] += 1
             continue
         sport, dport, seq, payload = tcp
+        if port not in (sport, dport):
+            skipped[f"TCP not on port {port}"] += 1
+            continue
+        if not payload:
+            continue                               # handshake / pure ACK / FIN
         key = (src, sport, dst, dport)
-        st = streams.setdefault(key, {"buf": bytearray(), "next": None})
+        st = streams.setdefault(key, {"buf": bytearray(), "next": None, "ts": ts})
         if st["next"] is None:
             st["next"] = seq                       # first payload byte seen
-        offset = (seq - st["next"]) & 0xFFFFFFFF    # distance past next expected
-        if offset > len(payload) and offset < 0x80000000:
-            # Gap (a lost/earlier segment); resync to this segment.
+        ahead = _seq_diff(seq, st["next"])         # >0 gap, <0 overlap, 0 in order
+        if ahead > 0:
+            # Bytes between the last segment and this one were never
+            # captured. Whatever frame was being assembled is broken: log it
+            # as malformed and restart framing at this segment.
+            skipped["TCP gap (bytes missing from capture)"] += 1
+            if st["buf"]:
+                records.append((st["ts"], src, dst, sport, dport, bytes(st["buf"])))
+                st["buf"].clear()
             st["next"] = seq
-            offset = 0
-        if offset >= len(payload):
-            continue                               # fully retransmitted; skip
-        payload = payload[offset:]
+        elif ahead < 0:
+            if -ahead >= len(payload):
+                skipped["TCP retransmission (already seen)"] += 1
+                continue
+            payload = payload[-ahead:]             # keep only the new tail
         st["buf"].extend(payload)
         st["next"] = (st["next"] + len(payload)) & 0xFFFFFFFF
+        st["ts"] = ts
         for frame in iter_frames(st["buf"]):
             records.append((ts, src, dst, sport, dport, frame))
 
-    records.sort(key=lambda r: r[0])
+    for (src, sport, dst, dport), st in streams.items():
+        if st["buf"]:
+            skipped["incomplete frame at end of stream (logged as malformed)"] += 1
+            records.append((st["ts"], src, dst, sport, dport, bytes(st["buf"])))
+
+    records.sort(key=lambda r: r[0])               # stable: ties keep stream order
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     n = 0
     with open(csv_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         w.writeheader()
         for ts, src, dst, sport, dport, frame in records:
-            if len(frame) < 8:
-                continue
-            tid, pid, length, unit = struct.unpack(">HHHB", frame[:7])
-            fc = frame[7]
-            direction = "req" if dport == 502 else "resp"
+            direction = "req" if dport == port else "resp"
             client_port = sport if direction == "req" else dport
-            address, count, values = decode_pdu(fc, frame[8:], direction)
-            w.writerow({
-                "wall_time": f"{ts:.6f}", "monotonic": f"{ts:.6f}",
-                "direction": direction, "client_port": client_port,
-                "transaction_id": tid, "protocol_id": pid, "length": length,
-                "unit_id": unit, "function_code": fc,
-                "address": "" if address is None else address,
-                "count": "" if count is None else count,
-                "values": values, "raw_hex": frame.hex(),
-                "src_ip": src, "dst_ip": dst,
-            })
+            w.writerow({"wall_time": f"{ts:.6f}", "monotonic": f"{ts:.6f}",
+                        **frame_row(direction, client_port, frame),
+                        "src_ip": src, "dst_ip": dst})
             n += 1
     return n
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
+    args = sys.argv[1:]
+    port = MODBUS_PORT
+    if "--port" in args:
+        i = args.index("--port")
+        port = int(args[i + 1])
+        del args[i:i + 2]
+    if len(args) != 2:
         raise SystemExit(__doc__)
-    n = convert(Path(sys.argv[1]), Path(sys.argv[2]))
-    print(f"{sys.argv[1]} -> {sys.argv[2]} ({n} Modbus frames)")
+    skipped = Counter()
+    n = convert(Path(args[0]), Path(args[1]), port, skipped)
+    print(f"{args[0]} -> {args[1]} ({n} Modbus frames)")
+    for reason, count in skipped.most_common():
+        print(f"  skipped/flagged: {count:6d}  {reason}")
 
 
 if __name__ == "__main__":

@@ -73,14 +73,46 @@ DEFAULT_CONTAMINATION = 0.1   # expected outlier fraction; tune to the data
 RANDOM_STATE = 42
 
 
+def normal_training_rows(df):
+    """The rows an ML detector may train on: requests labeled benign. With a
+    labeled file, unscored rows (the replay seed, unmatched or unknown
+    frames) are left out too: their is_attack is a blank read as 0, not a
+    real 'benign' label."""
+    if "is_attack" in df.columns:
+        keep = df["is_attack"] == 0
+        if "scored" in df.columns:
+            keep &= df["scored"]
+        df = df[keep]
+    if len(df) == 0:
+        raise ValueError("no benign requests to train on")
+    return df
+
+
+def median_real_gap(benign_df) -> float:
+    """Median inter-arrival over requests that have a predecessor on their
+    connection, used in place of each connection's placeholder first gap."""
+    real_gaps = benign_df.loc[~benign_df["first_on_connection"], "inter_arrival"]
+    gap = float(real_gaps.median())
+    if not np.isfinite(gap):
+        raise ValueError("training data has no connection with two or more requests, "
+                         "so there is no real inter-arrival gap to learn")
+    return gap
+
+
 def best_f1_threshold(detector, tune_df) -> float:
     """The anomaly score, among those seen in the labeled tuning session,
     that gives the best F1 when used as the alert threshold (ties -> fewer
     false alarms). Shared by every ML detector with a score() method."""
     if "scored" in tune_df.columns:
         tune_df = tune_df[tune_df["scored"]]
-    scores = detector.score(tune_df)
     y = tune_df["is_attack"].to_numpy()
+    if not (y == 1).any() or not (y == 0).any():
+        # With no attacks every threshold has F1 0 and the "best" one is
+        # arbitrary; with no benign traffic false alarms cannot be measured.
+        raise ValueError(f"tuning session needs both attacks and benign requests "
+                         f"(has {int((y == 1).sum())} attack / {int((y == 0).sum())} "
+                         "benign scored requests)")
+    scores = detector.score(tune_df)
     best = None
     for t in np.unique(scores):
         pred = scores >= t
@@ -119,11 +151,9 @@ class MLAnomalyDetector:
         """Fit on benign-only traffic. Any attack rows present are ignored, so
         this stays true to 'trained on normal traffic only' even if a labeled
         file is passed in."""
-        if "is_attack" in benign_df.columns:
-            benign_df = benign_df[benign_df["is_attack"] == 0]
+        benign_df = normal_training_rows(benign_df)
         if self.fill_first_gap:
-            real_gaps = benign_df.loc[~benign_df["first_on_connection"], "inter_arrival"]
-            self.gap_fill_ = float(real_gaps.median())
+            self.gap_fill_ = median_real_gap(benign_df)
         X = self.scaler.fit_transform(self._features(benign_df))
         self.model.fit(X)
         return self

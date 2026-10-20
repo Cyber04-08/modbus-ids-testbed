@@ -54,18 +54,58 @@ from ocsvm import OneClassSVMDetector             # noqa: E402
 from rule_based import RuleBasedDetector          # noqa: E402
 
 
+NAN = float("nan")
+
+
+def ratio(num: int, den: int) -> float:
+    """num / den, or NaN when den is 0. An undefined metric (precision of a
+    detector that never alerted, recall on a session with no attacks) must not
+    read as 0.0, which is indistinguishable from 'always wrong'."""
+    return num / den if den else NAN
+
+
 def quality_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
     fp = int(((y_pred == 1) & (y_true == 0)).sum())
     fn = int(((y_pred == 0) & (y_true == 1)).sum())
     tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    fpr = fp / (fp + tn) if (fp + tn) else 0.0
-    accuracy = (tp + tn) / len(y_true) if len(y_true) else 0.0
+    precision = ratio(tp, tp + fp)
+    recall = ratio(tp, tp + fn)
+    # F1 = 2TP / (2TP + FP + FN): defined (0) when there are attacks or
+    # alerts but no hits, undefined only when there are neither.
+    f1 = ratio(2 * tp, 2 * tp + fp + fn)
+    fpr = ratio(fp, fp + tn)
+    accuracy = ratio(tp + tn, len(y_true))
     return {"TP": tp, "FP": fp, "FN": fn, "TN": tn, "precision": precision,
             "recall": recall, "f1": f1, "fpr": fpr, "accuracy": accuracy}
+
+
+def check_separate_sessions(**sessions) -> None:
+    """Abort if any two of the train / tune / test sessions share captured
+    requests. capture_tuning.py saves the tuning session by copying the
+    latest labeled.csv, so running the defaults right after it would score
+    the tuning session against itself."""
+    keys = {name: set(zip(df["wall_time"], df["raw_hex"])) for name, df in sessions.items()}
+    names = list(keys)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            shared = len(keys[a] & keys[b])
+            if shared:
+                raise SystemExit(
+                    f"The {a} and {b} sessions share {shared} captured requests; "
+                    "they must be separate captures. If labeled.csv was just "
+                    "copied to tuning_labeled.csv, capture a fresh test session "
+                    "(attacks/run_scenario.py + data/label_dataset.py) or pass "
+                    "a saved run: python detectors/evaluate.py <train> data/runs/run_01.csv")
+
+
+def label_problems(df) -> dict:
+    """Counts of requests the labeler could not attribute (they are left
+    unscored, which silently shrinks the denominator if not reported)."""
+    if "label" not in df.columns:
+        return {}
+    counts = df["label"].value_counts()
+    return {k: int(counts[k]) for k in ("unmatched", "unknown") if k in counts}
 
 
 def detection_latency(df, y_pred: np.ndarray) -> dict:
@@ -98,7 +138,14 @@ def contamination_from(tune_df) -> float:
     separate tuning session (the proposal's "tuned to the expected imbalance"),
     clamped to the range IsolationForest accepts."""
     y = tune_df["is_attack"].to_numpy()[scored_mask(tune_df)]
-    return min(max(float(y.mean()), 0.01), 0.5)
+    if len(y) == 0:
+        raise ValueError("tuning session has no scored requests")
+    share = float(y.mean())
+    clamped = min(max(share, 0.01), 0.5)
+    if clamped != share:
+        print(f"[evaluate] WARNING: tuning-session attack share {share:.3f} is outside "
+              f"0.01-0.5; contamination clamped to {clamped:.3f}", file=sys.stderr)
+    return clamped
 
 
 # Memory is measured in separate tracemalloc windows so training and detection
@@ -243,9 +290,17 @@ def main() -> None:
     train_df = load_requests(train_csv)
     tune_df = load_requests(tune_csv)
     test_df = load_requests(test_csv)
+    check_separate_sessions(train=train_df, tune=tune_df, test=test_df)
     mask = scored_mask(test_df)
     y = test_df["is_attack"].to_numpy()[mask]
     contamination = contamination_from(tune_df)
+    problems = label_problems(test_df)
+    if problems:
+        print(f"[evaluate] WARNING: test requests the labeler could not attribute "
+              f"(left unscored): {problems}", file=sys.stderr)
+    if not (y == 1).any() or not (y == 0).any():
+        print("[evaluate] WARNING: the test session lacks attacks or benign requests; "
+              "recall or FPR is undefined (nan)", file=sys.stderr)
 
     print("Modbus/TCP IDS - detector comparison")
     print(f"  train (normal only): {len(train_df)} requests  <- {train_csv}")

@@ -37,7 +37,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from evaluate import detection_latency, quality_metrics, scored_mask  # noqa: E402
+from evaluate import (detection_latency, quality_metrics, ratio,  # noqa: E402
+                      scored_mask)
 from features import load_requests                                    # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,7 +52,8 @@ def suricata_alerts(d: Path) -> list[dict]:
     out = []
     eve = d / "eve.json"
     if not eve.exists():
-        return out
+        # A tool that did not run is not a tool that raised no alerts.
+        raise SystemExit(f"Missing {eve}: run tools/nids/run_nids.sh for this session")
     for line in eve.read_text().splitlines():
         ev = json.loads(line)
         if ev.get("event_type") != "alert":
@@ -77,6 +79,10 @@ def zeek_log(path: Path) -> list[dict]:
 
 
 def zeek_alerts(d: Path) -> list[dict]:
+    # Zeek writes no log file when nothing was logged, so a missing log is
+    # normal; a missing output directory means Zeek never ran on the session.
+    if not d.is_dir():
+        raise SystemExit(f"Missing {d}: run tools/nids/run_nids.sh for this session")
     out = [{"port": int(r["port_"]), "tid": int(r["tid"]), "ts": float(r["ts"]),
             "sig": r["rule"]} for r in zeek_log(d / "modbus_project.log")]
     for name in ("notice.log", "weird.log"):
@@ -153,13 +159,21 @@ def main() -> None:
         with open(mr) as fh:
             for r in csv.DictReader(fh):
                 ours.setdefault(r["detector"], []).append(r)
+        our_runs = {r["run"] for rs in ours.values() for r in rs}
+        if our_runs != {f.stem for f in runs}:
+            raise SystemExit(f"{mr.name} covers runs {sorted(our_runs)} but data/runs has "
+                             f"{sorted(f.stem for f in runs)}; re-run "
+                             "detectors/multi_run.py --reuse so both sides use the same runs")
+    missing_timing = [(c, f.stem) for c in CONFIGS for f in runs if (c, f.stem) not in timing]
+    if missing_timing:
+        print(f"WARNING: no timing for {len(missing_timing)} tool run(s); s/run averages "
+              "the rest", file=sys.stderr)
 
     def pooled(rs):
         tp, fp, fn, tn = (sum(int(r[k]) for r in rs) for k in ("TP", "FP", "FN", "TN"))
-        p = tp / (tp + fp) if tp + fp else 0.0
-        rcl = tp / (tp + fn) if tp + fn else 0.0
-        f1 = 2 * p * rcl / (p + rcl) if p + rcl else 0.0
-        return p, rcl, f1, fp / (fp + tn) if fp + tn else 0.0, tp, fp, fn
+        # nan = undefined (e.g. precision of a tool that never alerted)
+        return (ratio(tp, tp + fp), ratio(tp, tp + fn), ratio(2 * tp, 2 * tp + fp + fn),
+                ratio(fp, fp + tn), tp, fp, fn)
 
     print(f"Off-the-shelf NIDS vs our detectors - {len(runs)} test runs, pooled")
     print(f"{'detector':<20}{'precision':>10}{'recall':>8}{'F1':>7}{'FPR':>7}"

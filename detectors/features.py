@@ -17,6 +17,8 @@ easy to read off here, which matters for writing up the methodology.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pandas as pd
 
@@ -33,15 +35,40 @@ ML_FEATURE_COLUMNS = ["function_code", "address", "value0", "count", "inter_arri
 OCSVM_FEATURE_COLUMNS = ML_FEATURE_COLUMNS + ["txid_delta"]
 
 
+READ_FCS = {1, 2, 3, 4}
+WRITE_SINGLE_FCS = {5, 6}
+WRITE_MULTI_FCS = {15, 16}
+
+
 def _first_value(values_field: str) -> float:
     """First integer in the space-separated `values` column (0 for reads,
-    which carry no written value)."""
+    which carry no written value). NaN if the field is present but is not a
+    number, so the caller can count it instead of reading it as a real 0."""
     if isinstance(values_field, str) and values_field.strip():
         try:
             return float(values_field.split()[0])
         except (ValueError, IndexError):
-            return 0.0
+            return float("nan")
     return 0.0
+
+
+def _malformed(df: pd.DataFrame, raw: dict) -> pd.Series:
+    """True for a request the parser could not fully decode: a required field
+    that was present but not a number, or a read/write whose address, count
+    or value is missing (the tap leaves them blank when the PDU is too short
+    to decode). Such a request used to become 'address 0, value 0', which can
+    look exactly like a normal coil-OFF write."""
+    bad = pd.Series(False, index=df.index)
+    for col in ("function_code", "transaction_id", "client_port", "wall_time"):
+        bad |= raw[col].isna()
+    fc = raw["function_code"]
+    reads = fc.isin(READ_FCS)
+    writes = fc.isin(WRITE_SINGLE_FCS | WRITE_MULTI_FCS)
+    bad |= (reads | writes) & (raw["address"].isna() | raw["count"].isna())
+    blank_values = df["values"].isna() | (df["values"].astype(str).str.strip() == "")
+    bad |= writes & blank_values
+    bad |= df["value0"].isna()
+    return bad
 
 
 def load_requests(csv_path: str) -> pd.DataFrame:
@@ -51,29 +78,49 @@ def load_requests(csv_path: str) -> pd.DataFrame:
     # values (e.g. the normal-only training session, which never sends FC16)
     # would otherwise be parsed as numbers, and _first_value would turn every
     # written value into 0 - the model would train on writes it never sees.
-    df = pd.read_csv(csv_path, dtype={"values": str})
+    # raw_hex too: an all-digit hex column would otherwise become numbers.
+    df = pd.read_csv(csv_path, dtype={"values": str, "raw_hex": str})
     df = df[df["direction"] == "req"].copy()
 
-    # Numeric coercions; reads leave address/count/value blank -> 0.
+    # Numeric coercions; reads leave address/count/value blank -> 0. The
+    # unfilled values are kept for the malformed check below.
+    raw = {}
     for col in ["function_code", "address", "count", "transaction_id", "client_port"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        raw[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = raw[col].fillna(0).astype(int)
     df["value0"] = df["values"].apply(_first_value)
-    df["wall_time"] = pd.to_numeric(df["wall_time"], errors="coerce")
+    df["wall_time"] = raw["wall_time"] = pd.to_numeric(df["wall_time"], errors="coerce")
+    df["malformed"] = _malformed(df, raw)
+    df["value0"] = df["value0"].fillna(0.0)
+    if df["malformed"].any():
+        print(f"[features] WARNING: {int(df['malformed'].sum())} request(s) in {csv_path} "
+              "could not be fully decoded; kept and marked malformed", file=sys.stderr)
 
-    df = df.sort_values("wall_time").reset_index(drop=True)
+    # Many requests share a timestamp (the Windows clock ticks in steps), so
+    # the sort must be stable: ties keep the file's order, which is the order
+    # the tap saw them on the wire. Stateful features below depend on it.
+    df = df.sort_values("wall_time", kind="stable").reset_index(drop=True)
 
-    # Inter-arrival time within each TCP connection (client_port). The first
-    # request on a connection has no predecessor -> 0, and is marked so the
-    # ML detector can replace that placeholder, which is not a measured gap
-    # (left in, it made each session's first request look unusual).
+    # A connection is (src_ip, client_port) when the capture has real hosts
+    # (pcap_to_csv on the GRFICSv2 plant): ports can repeat across hosts. On
+    # the single-host testbed every client is 127.0.0.1, so the port alone.
+    if "src_ip" in df.columns:
+        df["conn"] = df["src_ip"].astype(str) + ":" + df["client_port"].astype(str)
+    else:
+        df["conn"] = df["client_port"].astype(str)
+
+    # Inter-arrival time within each TCP connection. The first request on a
+    # connection has no predecessor -> 0, and is marked so the ML detector
+    # can replace that placeholder, which is not a measured gap (left in, it
+    # made each session's first request look unusual).
     df["inter_arrival"] = (
-        df.groupby("client_port")["wall_time"].diff().fillna(0.0)
+        df.groupby("conn")["wall_time"].diff().fillna(0.0)
     )
-    df["first_on_connection"] = df.groupby("client_port").cumcount() == 0
+    df["first_on_connection"] = df.groupby("conn").cumcount() == 0
     # Change in transaction ID on the same connection (first request -> 1,
     # i.e. treated as a normal increment).
     df["txid_delta"] = (
-        df.groupby("client_port")["transaction_id"].diff().fillna(1.0)
+        df.groupby("conn")["transaction_id"].diff().fillna(1.0)
     )
 
     if "is_attack" in df.columns:
@@ -81,6 +128,10 @@ def load_requests(csv_path: str) -> pd.DataFrame:
         # of the traffic stream, e.g. the replay's seed packet) but that is
         # not graded. `scored` keeps that distinction once blanks become 0.
         is_attack = pd.to_numeric(df["is_attack"], errors="coerce")
+        typo = is_attack.isna() & df["is_attack"].notna()
+        if typo.any():
+            raise ValueError(f"{csv_path}: {int(typo.sum())} is_attack value(s) are "
+                             "neither blank nor a number")
         df["scored"] = is_attack.notna()
         df["is_attack"] = is_attack.fillna(0).astype(int)
 

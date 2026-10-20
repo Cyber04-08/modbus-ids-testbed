@@ -17,6 +17,10 @@ Invariants checked (each firing sets is_attack=1 and names the rule):
      FC16 block-write that includes HR0.
   3. value_out_of_range        - a pump-setpoint write outside 0-100%, or a
      coil write that isn't ON/OFF. Catches the injection's 60000 setpoint.
+  0. malformed_request         - a request the parser could not fully decode
+     (features.load_requests marks it). A frame too short to carry its
+     address/value used to read as "write coil 0, value 0", which passes
+     every other rule; a well-behaved master never sends one.
   4. replay_reused_txid        - on a single connection, a write that reuses a
      transaction ID already seen with an identical payload. A well-behaved
      master strictly increments its transaction ID, so a verbatim re-send with
@@ -68,7 +72,7 @@ COIL_VALUES = {0, 0xFF00}                   # Modbus OFF / ON encodings
 class RuleBasedDetector:
     def __init__(self):
         # Per-connection memory for the replay rule.
-        self._seen_txid_payload: dict[int, dict[int, str]] = {}
+        self._seen_txid_payload: dict[str, dict[int, str]] = {}
 
     def reset(self) -> None:
         self._seen_txid_payload.clear()
@@ -80,9 +84,14 @@ class RuleBasedDetector:
         addr = int(row.address)
         count = int(row.count) or 1
         value0 = float(row.value0)
-        port = int(row.client_port)
+        # Connection key from load_requests ((src_ip, port) when the capture
+        # has real hosts); a bare row without it falls back to the port.
+        conn = str(getattr(row, "conn", row.client_port))
         txid = int(row.transaction_id)
         raw = str(row.raw_hex)
+
+        if getattr(row, "malformed", False):
+            return 1, "malformed_request"
 
         if fc not in ALLOWED_FUNCTION_CODES:
             return 1, "function_code_not_allowed"
@@ -108,7 +117,7 @@ class RuleBasedDetector:
 
             # Replay rule: reused transaction ID with identical payload on the
             # same connection.
-            seen = self._seen_txid_payload.setdefault(port, {})
+            seen = self._seen_txid_payload.setdefault(conn, {})
             if txid in seen and seen[txid] == raw:
                 return 1, "replay_reused_txid"
             seen[txid] = raw

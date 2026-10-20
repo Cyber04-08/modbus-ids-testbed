@@ -16,3 +16,8 @@ data/v3_before_value_fix/
 data/pcap/
 data/nids/
 data/grfics/
+data/backups/
+data/v4_oct15_recovered/
+data/v4_oct16_overwrite/
+data/v5_before_bugfixes/
+.pytest_cache/

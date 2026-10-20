@@ -48,7 +48,8 @@ from sklearn.svm import OneClassSVM
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from features import (OCSVM_FEATURE_COLUMNS, build_feature_matrix,  # noqa: E402
                       load_requests)
-from ml_anomaly import best_f1_threshold                              # noqa: E402
+from ml_anomaly import (best_f1_threshold, median_real_gap,          # noqa: E402
+                        normal_training_rows)
 
 DEFAULT_NU = 0.05
 
@@ -69,10 +70,8 @@ class OneClassSVMDetector:
 
     def fit(self, benign_df) -> "OneClassSVMDetector":
         """Fit on benign-only traffic (attack rows, if any, are dropped)."""
-        if "is_attack" in benign_df.columns:
-            benign_df = benign_df[benign_df["is_attack"] == 0]
-        real_gaps = benign_df.loc[~benign_df["first_on_connection"], "inter_arrival"]
-        self.gap_fill_ = float(real_gaps.median())
+        benign_df = normal_training_rows(benign_df)
+        self.gap_fill_ = median_real_gap(benign_df)
         self.model.fit(self.scaler.fit_transform(self._features(benign_df)))
         return self
 

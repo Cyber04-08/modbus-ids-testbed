@@ -786,3 +786,61 @@ Reading (consistent with the testbed, where the SVM led at F1 0.96):
 
 The headline accuracy-vs-cost trade-off and the SVM's lead both hold on the
 higher-fidelity plant, which is the cross-check this item set out to provide.
+
+## 2026-10-20 - Reproducibility check and silent-failure fixes
+
+A review of the evaluation code found that the reported 10-run results
+(2026-10-15) could not be reproduced from the files on disk, plus a set of
+places where the pipeline could fail without saying so. All fixed; the
+reported results are unchanged.
+
+### The training and tuning sessions had been overwritten
+
+On 2026-10-16 15:25 a short new capture replaced `data/baseline_capture.csv`
+(21 requests instead of the 90 the results were trained on) and
+`data/tuning_labeled.csv`. Both are gitignored, so git had no copy. Scored
+with the overwritten files, the one-class SVM looked worse (F1 0.87-0.93,
+FPR 0.02-0.05), which would have been a misleading "result".
+
+Recovery: the pcaps exported on 2026-10-15 21:20 (`data/pcap/`, before the
+overwrite) were converted back with `tools/pcap_to_csv.py`. The tuning
+labels were rebuilt from the scenario's fixed connection layout (operator,
+replay with its seed first, injection; `data/v4_oct15_recovered/relabel.py`).
+The method was checked on run_01, whose original CSV still exists: all 162
+frames, the request order and every label came back identical. With the
+recovered files, all 10 runs again give OC-SVM P1.000 R0.929 F1 0.963 FPR 0,
+matching the reported numbers exactly. The overwritten files are kept in
+`data/v4_oct16_overwrite/`, the pre-fix results in `data/v5_before_bugfixes/`.
+
+Prevention: `capture_baseline.py` and `capture_tuning.py` now move an
+existing output file to `data/backups/` (timestamped) instead of overwriting
+it, and `multi_run.py` writes `data/multi_run_provenance.json` (SHA-256 of the
+train, tune and every run file, git commit, seeds).
+
+### Silent failures fixed
+
+| Where | Problem | Fix |
+|---|---|---|
+| `evaluate.py` defaults | `capture_tuning.py` copies `labeled.csv` to `tuning_labeled.csv`, so the default test set could be the tuning session itself | `check_separate_sessions()` aborts if two sessions share captured requests |
+| `label_dataset.py` | Unmatched / unknown / out-of-window packets only printed a WARNING (exit 0), and `multi_run.py` discarded the output, so a bad run could be scored with attacks missing from the count; one lost packet unmatched every later one | Exits 1 on any problem; resyncs past a lost packet; rejects unknown roles; `multi_run.py` shows a failed step's output and refuses runs with unattributed requests |
+| `features.py` | Unstable sort on tied timestamps (common on Windows); unparseable fields silently became 0 (a truncated write read as "coil 0 OFF"); connections keyed by port only | Stable sort (file order = wire order); `malformed` column + warning; `conn` = (src_ip, port) when the capture has IPs |
+| `rule_based.py` | Malformed requests passed every rule | New `malformed_request` rule; replay memory keyed by `conn` |
+| ML detectors | Unscored rows (replay seed) could count as benign training data; NaN gap fill or a tuning session without attacks failed obscurely | Train on scored benign rows only; clear errors |
+| Metrics | Undefined precision/recall reported as 0.0 (a silent tool looked "always wrong"); zero-width CIs over runs that all replay one attack script | NaN for undefined; pooled counts with Wilson 95% intervals and per-attack-type recall in `multi_run.py` |
+| `modbus_tap.py` | Frames under 8 bytes dropped; an impossible length field stalled logging for ~65 KB; errors swallowed; a full shutdown could cut off the PLC's last reply | Short / invalid frames logged (marked malformed); errors reported; frames logged before forwarding; half-close |
+| `export_pcap.py` | FIN placed at the first frame with the connection's last timestamp, so tied final frames came after it and were lost on reassembly | FIN after the last frame by position. Effect on the Zeek/Suricata comparison: 23 responses (unscored) and 1 benign request lost over 10 runs, none of them attacks, all the last frames on their connection, so the reported NIDS results are unaffected |
+| `pcap_to_csv.py` | Parsed all TCP as Modbus; wrong arithmetic for partial overlaps and small gaps; skipped packets uncounted | Port filter (502 default); signed sequence arithmetic; skip counts by reason; incomplete frames logged. Re-converting the GRFICSv2 pcaps gives byte-identical CSVs |
+| `nids_compare.py` | A missing tool output counted as "no alerts"; results from a different run set could be compared | Errors on missing output; checks both sides use the same runs |
+
+Verification: `multi_run.py --reuse`, `grfics_eval.py` and `nids_compare.py`
+give the same detections and quality numbers before and after the fixes
+(differences only in the 16th decimal and 0.000 -> nan for the precision of
+tools that never alerted); a live `run_scenario.py --quick` run captured 49
+requests and all 49 replies, labeled 15/15 attack packets and gave OC-SVM
+F1 0.963. A pytest suite (`tests/`, 58 tests, `python -m pytest tests`) covers
+each fix; 12 of the regression tests fail on the previous commit.
+
+New numbers from the added statistics (10 runs, pooled): OC-SVM FPR 0/610,
+Wilson 95% interval 0-0.006; recall 130/140 (0.874-0.961); per attack type,
+replay 80/80 and injection 50/60 (the one miss per run is the FC5 coil-OFF
+injection). Rule-based: replay 80/80, injection 20/60.

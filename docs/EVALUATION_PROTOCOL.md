@@ -92,6 +92,26 @@ unaffected (it has no tuned parameters).
 Limitation: every session runs the same attack sequence; only the benign
 traffic varies between sessions. Varied and harder attacks are planned.
 
+Enforced since 2026-10-20: `evaluate.py` and `multi_run.py` abort if any two
+of the train / tune / test sessions share a captured request (the tuning
+session is saved by copying `labeled.csv`, so the old defaults could score it
+against itself), and the capture scripts move an existing session file to
+`data/backups/` instead of overwriting it. `multi_run.py` records the SHA-256
+of every input file in `data/multi_run_provenance.json`.
+
+How results are stated: because every test session replays the same attack
+script, a detector that misses one fixed packet misses it in every run, so
+the over-runs confidence interval is exactly 0 and says only that the runs
+agree. Rates are therefore also given as pooled counts with a Wilson 95%
+interval, e.g. OC-SVM: 0 false alarms in 610 benign requests (true rate
+0-0.6%), recall 130/140 (0.87-0.96).
+
+Design choices tuned against the saved test runs: the transaction-ID-change
+feature, the first-gap fill and the one-class SVM's `nu` were chosen while
+scoring the same 10 saved runs (the tuning session decides thresholds, but
+these design decisions were compared on test results). The planned harder
+attacks will be scored once, as an untouched final test.
+
 ## 4. What the overhead numbers claim
 
 The detectors analyze a recorded copy of the traffic. They are not in the

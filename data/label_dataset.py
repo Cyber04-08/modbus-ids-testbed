@@ -22,7 +22,10 @@ How each frame is labeled:
     itself a replay) is labeled "replay_seed" and left unscored.
   * Cross-checks, reported rather than silently trusted: every logged packet
     must match exactly one captured request, and every attack request must
-    fall inside its attack's recorded wall-clock window.
+    fall inside its attack's recorded wall-clock window. If any check fails
+    the labeled file is still written (for inspection) but the script exits
+    with status 1, so a pipeline that runs it (multi_run.py) stops instead of
+    scoring a run whose unmatched attacks quietly dropped out of the count.
 
 Uses only the standard library (csv/json) so it runs with no extra installs.
 
@@ -40,6 +43,7 @@ MANIFEST = DATA_DIR / "attack_manifest.json"
 LABELED_CSV = DATA_DIR / "labeled.csv"
 
 LABELS = ("benign", "replay", "injection", "replay_seed", "response", "unknown", "unmatched")
+ROLES = ("benign", "replay", "injection")
 
 
 def main() -> None:
@@ -51,12 +55,22 @@ def main() -> None:
     manifest = json.loads(MANIFEST.read_text())
     # JSON object keys are strings; normalize to int ports.
     port_roles = {int(p): role for p, role in manifest["source_port_roles"].items()}
+    bad_roles = sorted(set(port_roles.values()) - set(ROLES))
+    if bad_roles:
+        # A typo such as "Benign" would otherwise send the operator's traffic
+        # down the attack path, where none of it matches and all of it drops
+        # out of scoring.
+        raise SystemExit(f"Manifest has unknown role(s) {bad_roles}; expected {ROLES}")
     windows = {w["type"]: w for w in manifest.get("attack_windows", [])}
+    if len(windows) != len(manifest.get("attack_windows", [])):
+        raise SystemExit("Manifest has two attack windows of the same type; "
+                         "the labeler keys windows by type")
     # Per attack connection: the queue of packets its script logged, in send order.
     pending = {w["source_port"]: list(w.get("packets", [])) for w in windows.values()}
     logged_total = sum(len(q) for q in pending.values())
 
     counts = {k: 0 for k in LABELS}
+    lost = []          # logged packets skipped over because they were never captured
     window_mismatches = 0
     total = 0
 
@@ -80,7 +94,14 @@ def main() -> None:
                 label, is_attack = role, (0 if role == "benign" else "")
             else:
                 queue = pending.get(port, [])
-                if queue and queue[0]["raw_hex"] == row["raw_hex"]:
+                # Normally the next logged packet; if one logged packet never
+                # reached the capture, skip past it (it stays counted as not
+                # captured) instead of failing every later packet.
+                hit = next((i for i, rec in enumerate(queue)
+                            if rec["raw_hex"] == row["raw_hex"]), None)
+                if hit is not None:
+                    lost.extend(queue[:hit])
+                    del queue[:hit]
                     rec = queue.pop(0)
                     if rec["kind"] == "seed":
                         label, is_attack = "replay_seed", ""
@@ -101,7 +122,7 @@ def main() -> None:
             counts[label] += 1
             writer.writerow(row)
 
-    leftover = sum(len(q) for q in pending.values())
+    leftover = sum(len(q) for q in pending.values()) + len(lost)
     print(f"Labeled {total} frames -> {LABELED_CSV}")
     for k in LABELS:
         if counts[k] or k in ("benign", "replay", "injection"):
@@ -122,6 +143,8 @@ def main() -> None:
               "recorded time window - investigate.")
     else:
         print("  Cross-check OK: all attack-connection frames fall within their recorded windows.")
+    if leftover or counts["unmatched"] or counts["unknown"] or window_mismatches:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

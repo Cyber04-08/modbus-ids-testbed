@@ -45,8 +45,27 @@ time, memory).
   comparison on the GRFICSv2 plant (real OpenPLC, process simulation, HMI,
   firewall), captured passively from a sensor VM. The one-class SVM again
   leads (F1 0.957, 0 false alarms); it misses only in-range writes to the
-  actuator register (a sender-identity case). See `docs/SETUP_LOG.md`. Next:
-  varied and harder attacks.
+  actuator register (a sender-identity case). See `docs/SETUP_LOG.md`.
+- **Reproducibility check and silent-failure fixes (2026-10-20) - done.** The
+  training/tuning files behind the reported results had been overwritten by a
+  later capture; they were recovered from the exported pcaps and reproduce the
+  reported numbers exactly. Fixed a set of places where the pipeline could
+  fail quietly (labeler warnings ignored, tied-timestamp ordering, malformed
+  frames read as normal ones, the pcap exporter dropping tied final frames,
+  undefined metrics shown as 0); results unchanged. Added pooled Wilson 95%
+  intervals, per-attack-type recall, a provenance file and a test suite
+  (`tests/`). See `docs/SETUP_LOG.md`. Next: varied and harder attacks.
+
+## Tests
+
+```
+pip install pytest
+python -m pytest tests
+```
+
+58 tests: Modbus framing, feature extraction, every rule, the labeler, the
+metrics and session-separation checks, the pcap round trip, and one
+regression test for each silent failure fixed on 2026-10-20.
 
 ## Quick start
 
@@ -99,8 +118,8 @@ pip install numpy pandas scikit-learn
 python testbed/capture_baseline.py            # train session -> data/baseline_capture.csv (normal only)
 python attacks/capture_tuning.py              # tune session  -> data/tuning_labeled.csv
 python attacks/run_scenario.py && python data/label_dataset.py   # test session -> data/labeled.csv
-python detectors/evaluate.py                  # head-to-head comparison
-python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI
+python detectors/evaluate.py                  # head-to-head comparison (refuses if test = tune)
+python detectors/multi_run.py 10              # 10 fresh runs -> mean +/- 95% CI, pooled Wilson CIs
 python testbed/capture_baseline.py 3600 data/baseline_60min.csv   # long normal session
 python detectors/training_curve.py            # ML quality vs training length
 python tools/export_pcap.py --all data/pcap    # sessions -> pcap for Suricata/Zeek

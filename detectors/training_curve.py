@@ -32,7 +32,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evaluate import (contamination_from, eval_ml, eval_ocsvm,  # noqa: E402
-                      quality_metrics, scored_mask)
+                      quality_metrics, ratio, scored_mask)
 from features import load_requests                                           # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,9 +75,9 @@ def main() -> None:
             tp, fp, fn, tn = (int(v) for v in tot)
             row = {"minutes": minutes, "train_requests": len(train), "detector": name,
                    "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-                   "precision": tp / (tp + fp) if tp + fp else 0.0,
-                   "recall": tp / (tp + fn) if tp + fn else 0.0,
-                   "fpr": fp / (fp + tn) if fp + tn else 0.0,
+                   "precision": ratio(tp, tp + fp),
+                   "recall": ratio(tp, tp + fn),
+                   "fpr": ratio(fp, fp + tn),
                    "fpr_min": min(fprs), "fpr_max": max(fprs),
                    "train_ms": float(np.mean(train_ms)),
                    "model_kb": float(np.mean(model_kb))}

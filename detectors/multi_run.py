@@ -29,7 +29,18 @@ stay in the stream the detectors see but are not graded).
 Outputs:
     data/runs/run_XX.csv            - each run's labeled test set
     data/multi_run_results.csv      - one row per (run, detector)
-    data/multi_run_summary.csv      - mean / std / 95% CI per metric
+    data/multi_run_summary.csv      - mean / std / 95% CI per metric, plus
+                                      pooled counts with Wilson 95% intervals
+    data/multi_run_provenance.json  - SHA-256 of the train, tune and every
+                                      run file, the git commit and the seeds,
+                                      so a result can be traced to its inputs
+
+Why both kinds of interval: every test session replays the same attack
+script, so a detector that misses one fixed packet misses it in every run and
+the over-runs spread is exactly 0. That 0 says the runs agree, not that the
+rate is known exactly. The pooled Wilson interval treats the pooled requests
+as the sample and gives an honest range (e.g. 0 false alarms in ~600 benign
+requests still allows a true rate up to ~0.6%).
 
 Usage:
     python detectors/multi_run.py              # 10 runs (~9 min)
@@ -40,6 +51,8 @@ Usage:
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 import shutil
 import subprocess
@@ -49,8 +62,9 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from evaluate import (contamination_from, detection_latency, eval_ml,  # noqa: E402
-                      eval_ocsvm, eval_rule_based, quality_metrics, scored_mask)
+from evaluate import (check_separate_sessions, contamination_from,  # noqa: E402
+                      detection_latency, eval_ml, eval_ocsvm, eval_rule_based,
+                      label_problems, quality_metrics, ratio, scored_mask)
 from features import load_requests                                 # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,8 +75,10 @@ TRAIN_CSV = DATA_DIR / "baseline_capture.csv"
 TUNE_CSV = DATA_DIR / "tuning_labeled.csv"
 RESULTS_CSV = DATA_DIR / "multi_run_results.csv"
 SUMMARY_CSV = DATA_DIR / "multi_run_summary.csv"
+PROVENANCE_JSON = DATA_DIR / "multi_run_provenance.json"
 
 METRICS = ["precision", "recall", "f1", "fpr", "accuracy",
+           "recall_replay", "recall_injection",
            "latency_replay_s", "latency_injection_s",
            "per_request_ms", "peak_kb", "model_kb", "train_peak_kb", "train_ms"]
 
@@ -81,11 +97,42 @@ def t_crit(df: int) -> float:
     return T95[max(smaller)] if smaller else T95[1]
 
 
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score 95% interval for a proportion k/n (well behaved at 0 and
+    1, unlike the normal approximation)."""
+    if n == 0:
+        return math.nan, math.nan
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git_head() -> str:
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
+                              text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def run_step(args: list) -> None:
+    """Run a pipeline step quietly, but show its output if it fails (the
+    labeler exits non-zero when packets could not be matched)."""
+    p = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stdout + p.stderr)
+        raise SystemExit(f"[multi-run] step failed ({Path(args[1]).name}, exit "
+                         f"{p.returncode}); output above")
+
+
 def capture_run(i: int, quick: bool) -> Path:
-    args = [PY, str(ROOT / "attacks" / "run_scenario.py")] + (["--quick"] if quick else [])
-    subprocess.run(args, check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
-    subprocess.run([PY, str(DATA_DIR / "label_dataset.py")], check=True, cwd=ROOT,
-                   stdout=subprocess.DEVNULL)
+    run_step([PY, str(ROOT / "attacks" / "run_scenario.py")] + (["--quick"] if quick else []))
+    run_step([PY, str(DATA_DIR / "label_dataset.py")])
     out = RUNS_DIR / f"run_{i:02d}.csv"
     shutil.copyfile(DATA_DIR / "labeled.csv", out)
     return out
@@ -94,8 +141,14 @@ def capture_run(i: int, quick: bool) -> Path:
 def score_run(train_df, tune_df, test_csv: Path, seed: int,
               contamination: float) -> list[dict]:
     test_df = load_requests(str(test_csv))
+    check_separate_sessions(train=train_df, tune=tune_df, test=test_df)
+    problems = label_problems(test_df)
+    if problems:
+        raise SystemExit(f"[multi-run] {test_csv.name}: requests the labeler could "
+                         f"not attribute: {problems}; fix the labels before scoring")
     mask = scored_mask(test_df)
     y = test_df["is_attack"].to_numpy()[mask]
+    labels = test_df["label"].to_numpy()[mask]
 
     rows = []
     for name, (pred, cost) in (
@@ -107,11 +160,19 @@ def score_run(train_df, tune_df, test_csv: Path, seed: int,
     ):
         q = quality_metrics(y, pred[mask])
         lat = detection_latency(test_df, pred)
+        p = pred[mask]
+        per_type = {}
+        for atk in ("replay", "injection"):
+            m = labels == atk
+            per_type[f"tp_{atk}"] = int((p[m] == 1).sum())
+            per_type[f"n_{atk}"] = int(m.sum())
+            per_type[f"recall_{atk}"] = ratio(per_type[f"tp_{atk}"], per_type[f"n_{atk}"])
         rows.append({
             "run": test_csv.stem, "detector": name,
             "n_requests": len(y), "n_attack": int(y.sum()),
             **{k: q[k] for k in ("TP", "FP", "FN", "TN", "precision",
                                  "recall", "f1", "fpr", "accuracy")},
+            **per_type,
             # A missed attack has no latency; left blank and counted separately.
             "latency_replay_s": lat.get("replay"),
             "latency_injection_s": lat.get("injection"),
@@ -129,7 +190,10 @@ def summarize(results: list[dict]) -> list[dict]:
     for det in DETECTORS:
         dr = [r for r in results if r["detector"] == det]
         for m in METRICS:
+            # None = attack missed (latency); NaN = metric undefined in that
+            # run. Both are left out of the mean and counted in "missed".
             vals = np.array([r[m] for r in dr if r[m] is not None], dtype=float)
+            vals = vals[~np.isnan(vals)]
             n = len(vals)
             mean = float(vals.mean()) if n else math.nan
             std = float(vals.std(ddof=1)) if n > 1 else 0.0
@@ -139,13 +203,30 @@ def summarize(results: list[dict]) -> list[dict]:
                             "ci95_low": mean - half, "ci95_high": mean + half})
         # Pooled confusion matrix over all runs: a micro-averaged view that
         # is not skewed by runs with very few attack requests.
+        # The interval columns hold the Wilson 95% interval of the pooled
+        # proportion and "n" its denominator.
         tp, fp, fn, tn = (sum(r[k] for r in dr) for k in ("TP", "FP", "FN", "TN"))
-        for m, v in (("pooled_precision", tp / (tp + fp) if tp + fp else 0.0),
-                     ("pooled_recall", tp / (tp + fn) if tp + fn else 0.0),
-                     ("pooled_fpr", fp / (fp + tn) if fp + tn else 0.0)):
-            summary.append({"detector": det, "metric": m, "n": len(dr), "missed": 0,
-                            "mean": v, "std": "", "ci95_low": "", "ci95_high": ""})
+        pooled = [("pooled_precision", tp, tp + fp), ("pooled_recall", tp, tp + fn),
+                  ("pooled_fpr", fp, fp + tn)]
+        for atk in ("replay", "injection"):
+            pooled.append((f"pooled_recall_{atk}", sum(r[f"tp_{atk}"] for r in dr),
+                           sum(r[f"n_{atk}"] for r in dr)))
+        for m, k, n in pooled:
+            lo, hi = wilson(k, n)
+            summary.append({"detector": det, "metric": m, "n": n, "missed": 0,
+                            "mean": ratio(k, n), "std": "", "ci95_low": lo, "ci95_high": hi})
     return summary
+
+
+def write_provenance(train: Path, tune: Path, run_files: list[Path]) -> None:
+    PROVENANCE_JSON.write_text(json.dumps({
+        "git_head": git_head(),
+        "train": {"file": train.name, "sha256": sha256(train)},
+        "tune": {"file": tune.name, "sha256": sha256(tune)},
+        "runs": [{"file": f.name, "sha256": sha256(f), "iforest_seed": seed}
+                 for seed, f in enumerate(run_files)],
+        "ocsvm_nu": 0.05,
+    }, indent=2) + "\n")
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -167,8 +248,7 @@ def main() -> None:
     train_df = load_requests(str(TRAIN_CSV))
     if not TUNE_CSV.exists():
         print("[multi-run] no tuning session yet - capturing one...", flush=True)
-        subprocess.run([PY, str(ROOT / "attacks" / "capture_tuning.py")], check=True,
-                       cwd=ROOT, stdout=subprocess.DEVNULL)
+        run_step([PY, str(ROOT / "attacks" / "capture_tuning.py")])
     tune_df = load_requests(str(TUNE_CSV))
     contamination = contamination_from(tune_df)
 
@@ -188,6 +268,7 @@ def main() -> None:
     write_csv(RESULTS_CSV, results)
     summary = summarize(results)
     write_csv(SUMMARY_CSV, summary)
+    write_provenance(TRAIN_CSV, TUNE_CSV, run_files)
 
     print(f"\nModbus/TCP IDS - {len(run_files)}-run comparison "
           f"(train: {len(train_df)} benign requests; ML contamination "
@@ -208,12 +289,19 @@ def main() -> None:
                 cell += f" ({s['missed']} missed)"
             cells.append(cell)
         print(f"{m:<22}" + "".join(f"{c:>22}" for c in cells))
-    for m in ("pooled_precision", "pooled_recall", "pooled_fpr"):
-        print(f"{m:<22}" + "".join(f"{by[(d, m)]['mean']:>22.3f}" for d in DETECTORS))
-    print("\n(± is the 95% confidence half-width over runs; peak_kb is detection only,\n"
+    for m in ("pooled_precision", "pooled_recall", "pooled_fpr",
+              "pooled_recall_replay", "pooled_recall_injection"):
+        cells = []
+        for d in DETECTORS:
+            s = by[(d, m)]
+            cells.append(f"{s['mean']:.3f} [{s['ci95_low']:.3f}-{s['ci95_high']:.3f}]")
+        print(f"{m:<22}" + "".join(f"{c:>22}" for c in cells))
+    print("\n(± is the 95% confidence half-width over runs; [a-b] is the Wilson 95%\n"
+          " interval of the pooled proportion; peak_kb is detection only,\n"
           " train_peak_kb / train_ms are the one-time training step, model_kb is what\n"
           " the built detector keeps in memory while detecting)")
-    print(f"per-run rows -> {RESULTS_CSV}\nsummary      -> {SUMMARY_CSV}")
+    print(f"per-run rows -> {RESULTS_CSV}\nsummary      -> {SUMMARY_CSV}\n"
+          f"provenance   -> {PROVENANCE_JSON}")
 
 
 if __name__ == "__main__":

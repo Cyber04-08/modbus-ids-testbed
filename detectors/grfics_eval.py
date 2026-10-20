@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from features import load_requests                 # noqa: E402
 from ml_anomaly import MLAnomalyDetector           # noqa: E402
 from ocsvm import OneClassSVMDetector              # noqa: E402
-from evaluate import quality_metrics               # noqa: E402
+from evaluate import quality_metrics, ratio        # noqa: E402
 
 DATA = Path(__file__).resolve().parent.parent / "data" / "grfics"
 ATTACKER_IP = "192.168.95.50"
@@ -44,15 +44,10 @@ ACTUATOR_ADDR = 1
 
 
 def load_grfics(csv: str) -> pd.DataFrame:
-    """Load as usual, then recompute per-connection features grouped by
-    (src_ip, client_port): the plant has several hosts, so a port alone does
-    not identify a connection."""
-    df = load_requests(csv)
-    g = df.groupby(["src_ip", "client_port"])
-    df["inter_arrival"] = g["wall_time"].diff().fillna(0.0)
-    df["first_on_connection"] = g.cumcount() == 0
-    df["txid_delta"] = g["transaction_id"].diff().fillna(1.0)
-    return df
+    """Load as usual. The plant has several hosts, so a port alone does not
+    identify a connection; load_requests groups the per-connection features
+    by (src_ip, client_port) whenever the capture has a src_ip column."""
+    return load_requests(csv)
 
 
 def label(df: pd.DataFrame) -> pd.DataFrame:
@@ -125,10 +120,8 @@ def main() -> None:
             q = score(name, np.asarray(fn(t)), t)
             tot += [q["TP"], q["FP"], q["FN"], q["TN"]]
         tp, fp, fn, tn = tot
-        p = tp / (tp + fp) if tp + fp else 0.0
-        r = tp / (tp + fn) if tp + fn else 0.0
-        f1 = 2 * p * r / (p + r) if p + r else 0.0
-        fpr = fp / (fp + tn) if fp + tn else 0.0
+        p, r = ratio(tp, tp + fp), ratio(tp, tp + fn)
+        f1, fpr = ratio(2 * tp, 2 * tp + fp + fn), ratio(fp, fp + tn)
         print(f"{name:<26}{p:>10.3f}{r:>8.3f}{f1:>7.3f}{fpr:>7.3f}{tp:>5}{fp:>5}{fn:>5}")
 
     # Per-label recall, to show which attacks each detector catches.

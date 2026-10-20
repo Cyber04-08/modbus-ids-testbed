@@ -75,12 +75,21 @@ class _Conn:
 
 def export(csv_path: Path, pcap_path: Path) -> int:
     with open(csv_path, newline="") as f:
-        rows = [r for r in csv.DictReader(f) if r.get("raw_hex")]
-    rows.sort(key=lambda r: float(r["wall_time"]))
+        all_rows = list(csv.DictReader(f))
+    rows = [r for r in all_rows if r.get("raw_hex")]
+    if len(rows) != len(all_rows):
+        print(f"[export_pcap] WARNING: {len(all_rows) - len(rows)} row(s) of {csv_path.name} "
+              "have no raw bytes and are not in the pcap", file=sys.stderr)
+    rows.sort(key=lambda r: float(r["wall_time"]))   # stable: ties keep file order
 
-    last_seen: dict[int, float] = {}
-    for r in rows:
-        last_seen[int(r["client_port"])] = float(r["wall_time"])
+    # Index of each connection's last frame. The close (FIN) is sent after
+    # that frame, by position, not by time: when a connection's last two
+    # frames share a timestamp (common - the Windows clock ticks in steps), a
+    # time test closed the stream after the first of them, and every later
+    # frame landed after the FIN where stream reassembly drops it.
+    last_index: dict[int, int] = {}
+    for i, r in enumerate(rows):
+        last_index[int(r["client_port"])] = i
 
     packets: list[tuple[float, bytes]] = []
     conns: dict[int, _Conn] = {}
@@ -95,7 +104,7 @@ def export(csv_path: Path, pcap_path: Path) -> int:
                                    flags, payload)))
         c.s_seq += len(payload) + (1 if flags & (SYN | FIN) else 0)
 
-    for r in rows:
+    for i, r in enumerate(rows):
         t = float(r["wall_time"])
         port = int(r["client_port"])
         if port not in conns:
@@ -111,12 +120,12 @@ def export(csv_path: Path, pcap_path: Path) -> int:
             c2s(c, t, PSH | ACK, payload)
         else:
             s2c(c, t, PSH | ACK, payload)
-        if t == last_seen[port]:
+        if i == last_index[port]:
             c2s(c, t + 0.0010, FIN | ACK)
             s2c(c, t + 0.0011, FIN | ACK)
             c2s(c, t + 0.0012, ACK)
 
-    packets.sort(key=lambda p: p[0])
+    packets.sort(key=lambda p: p[0])                 # stable: ties keep build order
     pcap_path.parent.mkdir(parents=True, exist_ok=True)
     with open(pcap_path, "wb") as f:
         f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))

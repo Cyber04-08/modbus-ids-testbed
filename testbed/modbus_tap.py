@@ -94,12 +94,28 @@ class CsvLogger:
             self._fh.close()
 
 
+# MBAP length field = unit id + PDU. A Modbus PDU is at most 253 bytes, so a
+# valid length is 2 (unit id + function code) to 254.
+MIN_LENGTH, MAX_LENGTH = 2, 254
+
+
 def iter_frames(buffer: bytearray):
     """Yield complete Modbus/TCP frames from a rolling byte buffer, leaving
     any partial trailing frame in place. A single TCP segment can carry more
-    than one frame, or split one across segments - both are handled here."""
+    than one frame, or split one across segments - both are handled here.
+
+    A header whose length field is impossible (below 2 or above 254) means
+    the stream is not valid Modbus/TCP from here on: there is no reliable
+    frame boundary to resync to. Everything buffered is yielded as one chunk
+    so it is still logged (as malformed) rather than silently waited on - a
+    length of 0xFFFF would otherwise hold the next ~65 KB of traffic unlogged."""
     while len(buffer) >= 7:
         length = struct.unpack(">H", buffer[4:6])[0]
+        if not MIN_LENGTH <= length <= MAX_LENGTH:
+            frame = bytes(buffer)
+            del buffer[:]
+            yield frame
+            return
         total = 6 + length  # 6 header bytes before length's own coverage + length
         if len(buffer) < total:
             break
@@ -108,56 +124,79 @@ def iter_frames(buffer: bytearray):
         yield frame
 
 
+def frame_row(direction: str, client_port: int, frame: bytes) -> dict:
+    """CSV row for one frame. A frame too short to hold a function code, or
+    whose length field is invalid, is still recorded with its raw bytes and
+    blank decoded fields; the detectors' loader marks it malformed."""
+    row = {"direction": direction, "client_port": client_port, "raw_hex": frame.hex(),
+           "transaction_id": "", "protocol_id": "", "length": "", "unit_id": "",
+           "function_code": "", "address": "", "count": "", "values": ""}
+    if len(frame) >= 7:
+        transaction_id, protocol_id, length, unit_id = struct.unpack(">HHHB", frame[:7])
+        row.update(transaction_id=transaction_id, protocol_id=protocol_id,
+                   length=length, unit_id=unit_id)
+        valid = MIN_LENGTH <= length <= MAX_LENGTH and len(frame) == 6 + length
+        if len(frame) >= 8 and valid:
+            function_code = frame[7]
+            address, count, values = decode_pdu(function_code, frame[8:], direction)
+            row.update(function_code=function_code,
+                       address="" if address is None else address,
+                       count="" if count is None else count, values=values)
+    return row
+
+
 def log_frame(logger: CsvLogger, direction: str, client_port: int, frame: bytes) -> None:
-    if len(frame) < 8:
-        return
-    transaction_id, protocol_id, length, unit_id = struct.unpack(">HHHB", frame[:7])
-    function_code = frame[7]
-    pdu_data = frame[8:]
-    address, count, values = decode_pdu(function_code, pdu_data, direction)
     logger.log({
         "wall_time": f"{time.time():.6f}",
         "monotonic": f"{time.monotonic():.6f}",
-        "direction": direction,
-        "client_port": client_port,
-        "transaction_id": transaction_id,
-        "protocol_id": protocol_id,
-        "length": length,
-        "unit_id": unit_id,
-        "function_code": function_code,
-        "address": "" if address is None else address,
-        "count": "" if count is None else count,
-        "values": values,
-        "raw_hex": frame.hex(),
+        **frame_row(direction, client_port, frame),
     })
 
 
 def pump(src: socket.socket, dst: socket.socket, direction: str,
          client_port: int, logger: CsvLogger) -> None:
-    """Forward bytes src->dst, parsing and logging each complete frame."""
+    """Forward bytes src->dst, parsing and logging each complete frame.
+
+    Frames are logged before they are forwarded, so a frame is on record even
+    if forwarding fails. When src closes, only dst's sending side is shut
+    (a half-close): the other direction keeps running until its own end
+    closes, so the PLC's reply to a client's last request is still captured.
+    Errors and bytes left in the buffer at close are reported, not dropped."""
     buffer = bytearray()
     try:
         while True:
             chunk = src.recv(4096)
             if not chunk:
                 break
-            dst.sendall(chunk)
             buffer.extend(chunk)
             for frame in iter_frames(buffer):
                 log_frame(logger, direction, client_port, frame)
-    except OSError:
-        pass
+            dst.sendall(chunk)
+    except OSError as e:
+        print(f"[tap] {direction} stream of client port {client_port} ended with "
+              f"error: {e}", file=sys.stderr, flush=True)
     finally:
-        for s in (src, dst):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        if buffer:
+            # A partial frame the connection closed in the middle of.
+            log_frame(logger, direction, client_port, bytes(buffer))
+            print(f"[tap] {direction} stream of client port {client_port} closed with "
+                  f"{len(buffer)} bytes of an incomplete frame (logged as malformed)",
+                  file=sys.stderr, flush=True)
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
 def handle_client(client_sock: socket.socket, client_addr, logger: CsvLogger) -> None:
     client_port = client_addr[1]
-    plc_sock = socket.create_connection((PLC_HOST, PLC_PORT))
+    try:
+        plc_sock = socket.create_connection((PLC_HOST, PLC_PORT))
+    except OSError as e:
+        print(f"[tap] cannot reach the PLC at {PLC_HOST}:{PLC_PORT} for client port "
+              f"{client_port}: {e}", file=sys.stderr, flush=True)
+        client_sock.close()
+        return
     threads = [
         threading.Thread(target=pump, args=(client_sock, plc_sock, "req", client_port, logger), daemon=True),
         threading.Thread(target=pump, args=(plc_sock, client_sock, "resp", client_port, logger), daemon=True),
