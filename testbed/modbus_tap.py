@@ -36,6 +36,11 @@ CSV_FIELDS = [
     "wall_time", "monotonic", "direction", "client_port",
     "transaction_id", "protocol_id", "length", "unit_id",
     "function_code", "address", "count", "values", "raw_hex",
+    # The client's IP. On this loopback testbed the operator is 127.0.0.1 and
+    # the harder attacks can come from a second address (127.0.0.66), standing
+    # in for a separate attacker host; captures made before this column was
+    # added are all 127.0.0.1.
+    "src_ip",
 ]
 
 # Function-code decoders for the fields the detectors care about. Requests
@@ -145,16 +150,18 @@ def frame_row(direction: str, client_port: int, frame: bytes) -> dict:
     return row
 
 
-def log_frame(logger: CsvLogger, direction: str, client_port: int, frame: bytes) -> None:
+def log_frame(logger: CsvLogger, direction: str, client_port: int, frame: bytes,
+              client_ip: str = "") -> None:
     logger.log({
         "wall_time": f"{time.time():.6f}",
         "monotonic": f"{time.monotonic():.6f}",
         **frame_row(direction, client_port, frame),
+        "src_ip": client_ip,
     })
 
 
 def pump(src: socket.socket, dst: socket.socket, direction: str,
-         client_port: int, logger: CsvLogger) -> None:
+         client_port: int, logger: CsvLogger, client_ip: str = "") -> None:
     """Forward bytes src->dst, parsing and logging each complete frame.
 
     Frames are logged before they are forwarded, so a frame is on record even
@@ -170,7 +177,7 @@ def pump(src: socket.socket, dst: socket.socket, direction: str,
                 break
             buffer.extend(chunk)
             for frame in iter_frames(buffer):
-                log_frame(logger, direction, client_port, frame)
+                log_frame(logger, direction, client_port, frame, client_ip)
             dst.sendall(chunk)
     except OSError as e:
         print(f"[tap] {direction} stream of client port {client_port} ended with "
@@ -178,7 +185,7 @@ def pump(src: socket.socket, dst: socket.socket, direction: str,
     finally:
         if buffer:
             # A partial frame the connection closed in the middle of.
-            log_frame(logger, direction, client_port, bytes(buffer))
+            log_frame(logger, direction, client_port, bytes(buffer), client_ip)
             print(f"[tap] {direction} stream of client port {client_port} closed with "
                   f"{len(buffer)} bytes of an incomplete frame (logged as malformed)",
                   file=sys.stderr, flush=True)
@@ -189,7 +196,7 @@ def pump(src: socket.socket, dst: socket.socket, direction: str,
 
 
 def handle_client(client_sock: socket.socket, client_addr, logger: CsvLogger) -> None:
-    client_port = client_addr[1]
+    client_ip, client_port = client_addr[0], client_addr[1]
     try:
         plc_sock = socket.create_connection((PLC_HOST, PLC_PORT))
     except OSError as e:
@@ -198,8 +205,10 @@ def handle_client(client_sock: socket.socket, client_addr, logger: CsvLogger) ->
         client_sock.close()
         return
     threads = [
-        threading.Thread(target=pump, args=(client_sock, plc_sock, "req", client_port, logger), daemon=True),
-        threading.Thread(target=pump, args=(plc_sock, client_sock, "resp", client_port, logger), daemon=True),
+        threading.Thread(target=pump, args=(client_sock, plc_sock, "req", client_port, logger, client_ip),
+                         daemon=True),
+        threading.Thread(target=pump, args=(plc_sock, client_sock, "resp", client_port, logger, client_ip),
+                         daemon=True),
     ]
     for t in threads:
         t.start()

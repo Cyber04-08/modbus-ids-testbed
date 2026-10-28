@@ -123,3 +123,74 @@ plant would need to dedicate to running it. They are not, and are not claimed
 to be, a measurement of control-loop delay. The passive tap is test
 instrumentation for capturing traffic on one machine, not part of either
 detector.
+
+## 5. Generalization check (does a detector work when the attack changes?)
+
+Section 3's limitation - every tuning and test session ran the same attack
+script - means a threshold tuned at best F1 on the tuning session may have
+been fitted to the one attack sequence it is later tested on. Three steps
+measure this (`detectors/generalization.py`):
+
+1. **Varied attacks.** `attacks/run_scenario.py --vary [--seed N]` draws, per
+   session, the attack order, the baseline padding, and a seed for each attack
+   script; the scripts then draw their own frames, counts and timing (replay:
+   which write is replayed, how many copies, 0.3-1.5 s apart; injection: 3-8
+   commands from the same kinds plus an in-band setpoint the fixed sequence
+   never sent). Every drawn value is recorded in the run's manifest, so a
+   varied session reproduces exactly. Without `--vary` the scripts send the
+   original bytes, so the Section 3 results still reproduce.
+2. **Three ways to set the ML alert threshold**, compared on the same runs:
+   tuned at best F1 on the fixed tuning session (the Section 3 protocol);
+   tuned on a separate varied session; and **label-free** - the score above
+   which at most 0.5 % of a separate normal-only session alerts, using no
+   attack labels at all (`ml_anomaly.normal_quantile_threshold`).
+3. **Leave-one-attack-type-out** and **threshold-free** quality: tune on one
+   attack type and grade on the other; and ROC AUC / PR AUC of each ML score,
+   so a result does not hinge on one threshold.
+
+Headline finding (10 varied runs, train 90 benign): the one-class SVM's
+separation is intact (ROC AUC and PR AUC 1.000 on varied as on fixed attacks),
+so its detection power was not an artifact of a repeated attack. What was
+fragile is threshold selection: a best-F1 threshold overfits the tuning
+attack, while the **label-free threshold gives F1 0.993 (recall 1.000, FPR
+0.4 %)** on varied attacks with no labels to overfit. The Isolation Forest's
+earlier numbers were optimistic (varied F1 ~0.58; recall 0 under the
+label-free threshold). The label-free threshold is therefore adopted as the
+one-class SVM's reported selection method.
+
+## 6. Harder attacks and countermeasures (limitations 1 and 2)
+
+Two attacks are built to defeat the signals the detectors relied on, run from
+two attacker origins, and scored once as a final test
+(`attacks/harder_scenario.py`, `detectors/harder_attacks.py`):
+
+| Attack | Defeats | How |
+|---|---|---|
+| `txid_replay.py` | reused-transaction-ID signal (rule `replay_reused_txid`, feature `txid_delta`) | resends one captured command with fresh, incrementing transaction IDs, paced like the operator (cover polls + write 1-5 ms later) |
+| `mimic_injection.py` | timing separation and value-range checks | injects in-band writes (setpoint 20-90 %, valves ON/OFF) 1-5 ms after its own cover polls |
+
+| Origin | Attacker source IP | Meaning |
+|---|---|---|
+| `separate` | 127.0.0.66 | a distinct host on the ICS LAN |
+| `spoof` | 127.0.0.1 | the operator's own address (co-located or spoofed) |
+
+Countermeasures added (off by default, so Sections 3 and 5 are unchanged):
+
+- **Sender identity** (rule `unknown_source`): flag a write from a host that
+  sent no traffic in the normal training session. `RuleBasedDetector(
+  known_sources=...)`.
+- **Value-change features** `repeat_run` (identical writes in a row to one
+  target) and `write_step` (step from the last value written), added to the
+  one-class SVM as `OCSVM_CONTEXT_FEATURE_COLUMNS` ("ocsvm-ctx"). A replay that
+  rewrites its transaction IDs still repeats the same command, which
+  `repeat_run` sees.
+
+Cover polls carry the label `cover` and are left unscored (they change nothing
+in the process). Results and the regression check (that the value-change
+features do not weaken the Section 5 varied-run result) are written to
+`data/harder/`. The honest boundary this exposes: a timing-mimicking, in-band
+injection sent from the operator's own address is not caught by any passive
+content/behaviour method here - only sender identity catches it, and only when
+the attacker is on a different host. That is the case Modbus/TCP authentication
+(Modbus/TCP Security, TLS with role-based authorization) exists to close, and
+it is stated as such rather than papered over.

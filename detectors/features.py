@@ -34,6 +34,18 @@ ML_FEATURE_COLUMNS = ["function_code", "address", "value0", "count", "inter_arri
 # trained on it never splits on it (tested, no effect).
 OCSVM_FEATURE_COLUMNS = ML_FEATURE_COLUMNS + ["txid_delta"]
 
+# Value-change features (limitation 2: a replay whose transaction IDs are
+# rewritten to look fresh). They describe a write against the process state
+# it lands on, across ALL connections (the PLC has one state, whoever wrote it):
+#   repeat_run - how many identical writes in a row this target has now
+#                received (1 = a new value; reads 0). The operator nudges the
+#                setpoint and toggles valves, so long runs of the same write
+#                are rare; a replayed command repeated n times builds a run of n.
+#   write_step - how far this write moves the target from the last value
+#                written to it (0 for reads; NaN for the first write to a
+#                target, filled by the detector with the training median).
+OCSVM_CONTEXT_FEATURE_COLUMNS = OCSVM_FEATURE_COLUMNS + ["repeat_run", "write_step"]
+
 
 READ_FCS = {1, 2, 3, 4}
 WRITE_SINGLE_FCS = {5, 6}
@@ -50,6 +62,33 @@ def _first_value(values_field: str) -> float:
         except (ValueError, IndexError):
             return float("nan")
     return 0.0
+
+
+def _value_change(df: pd.DataFrame) -> tuple[list, list]:
+    """repeat_run and write_step per request, in time order (see
+    OCSVM_CONTEXT_FEATURE_COLUMNS). A target is a coil or a holding register
+    at an address on one device (dst_ip when the capture has several, as on
+    the GRFICSv2 plant); an FC16 block write counts as a write to its first
+    register (value0)."""
+    devices = df["dst_ip"] if "dst_ip" in df.columns else [""] * len(df)
+    last: dict[tuple, tuple[float, int]] = {}   # target -> (last value, run length)
+    runs, steps = [], []
+    for fc, addr, value, dev in zip(df["function_code"], df["address"], df["value0"], devices):
+        if fc not in WRITE_SINGLE_FCS | WRITE_MULTI_FCS:
+            runs.append(0)
+            steps.append(0.0)
+            continue
+        target = (str(dev), "coil" if fc in (5, 15) else "reg", int(addr))
+        prev = last.get(target)
+        if prev is None:
+            run, step = 1, float("nan")
+        else:
+            run = prev[1] + 1 if value == prev[0] else 1
+            step = abs(float(value) - prev[0])
+        last[target] = (float(value), run)
+        runs.append(run)
+        steps.append(step)
+    return runs, steps
 
 
 def _malformed(df: pd.DataFrame, raw: dict) -> pd.Series:
@@ -108,6 +147,12 @@ def load_requests(csv_path: str) -> pd.DataFrame:
         df["conn"] = df["src_ip"].astype(str) + ":" + df["client_port"].astype(str)
     else:
         df["conn"] = df["client_port"].astype(str)
+        # Captures from before the tap logged the client IP are all from the
+        # single-host loopback testbed, where every client was 127.0.0.1.
+        df["src_ip"] = "127.0.0.1"
+    df["src_ip"] = df["src_ip"].fillna("").astype(str)
+
+    df["repeat_run"], df["write_step"] = _value_change(df)
 
     # Inter-arrival time within each TCP connection. The first request on a
     # connection has no predecessor -> 0, and is marked so the ML detector

@@ -54,7 +54,23 @@ time, memory).
   frames read as normal ones, the pcap exporter dropping tied final frames,
   undefined metrics shown as 0); results unchanged. Added pooled Wilson 95%
   intervals, per-attack-type recall, a provenance file and a test suite
-  (`tests/`). See `docs/SETUP_LOG.md`. Next: varied and harder attacks.
+  (`tests/`). See `docs/SETUP_LOG.md`.
+- **Second half, item 5 (varied / harder attacks) - done.** Three limitations
+  of the earlier results were addressed in turn (see
+  `docs/EVALUATION_PROTOCOL.md` sections 5-6):
+  - *Varied attacks* (`attacks/run_scenario.py --vary`,
+    `detectors/generalization.py`): with attacks that differ every session, the
+    one-class SVM's separation is intact (ROC AUC / PR AUC 1.000). The fragile
+    part was threshold selection; a **label-free threshold** (set from
+    normal-only traffic, no attack labels) gives F1 0.993 on varied attacks.
+  - *Harder attacks* (`attacks/txid_replay.py`, `attacks/mimic_injection.py`,
+    `attacks/harder_scenario.py`, `detectors/harder_attacks.py`): a replay with
+    rewritten transaction IDs and a timing-mimicking in-band injection, from a
+    separate host and from the operator's own address. **Sender identity**
+    recovers detection against a separate-host attacker; **value-change
+    features** recover the rewritten replay even from the operator's address; a
+    timing-mimicking in-band injection from the operator's own address is the
+    case that motivates Modbus/TCP authentication, and is reported as such.
 
 ## Tests
 
@@ -125,6 +141,10 @@ python detectors/training_curve.py            # ML quality vs training length
 python tools/export_pcap.py --all data/pcap    # sessions -> pcap for Suricata/Zeek
 # inside the sensor VM: sudo sh tools/setup_sensor.sh; bash tools/nids/run_nids.sh
 python detectors/nids_compare.py              # score Suricata/Zeek like our detectors
+
+# varied and harder attacks (second-half item 5; see docs/EVALUATION_PROTOCOL.md 5-6)
+python detectors/generalization.py --capture 10   # varied attacks; fixed vs varied vs label-free threshold
+python detectors/harder_attacks.py  --capture 10  # txid-rewrite replay + mimic injection, 2 origins, countermeasures
 ```
 
 - `detectors/features.py` - shared feature extraction (both detectors score
@@ -145,7 +165,16 @@ python detectors/nids_compare.py              # score Suricata/Zeek like our det
 - `detectors/ocsvm.py` - one-class SVM (RBF kernel) trained on normal
   traffic only, on the same five features plus the change in transaction ID
   on the connection (normal = +1, verbatim replay = 0); alert threshold at
-  the best F1 on the tuning session.
+  the best F1 on the tuning session, or label-free (`calibrate_normal`) at a
+  target false-alarm rate on a normal-only session. An optional context
+  feature set adds `repeat_run` and `write_step` for the harder replay.
+- `detectors/generalization.py` - varied-attack check: fixed vs varied vs
+  label-free threshold, leave-one-attack-type-out, and ROC/PR AUC
+  (`attacks/run_scenario.py --vary`).
+- `detectors/harder_attacks.py` - harder attacks and countermeasures
+  (`attacks/txid_replay.py`, `attacks/mimic_injection.py` via
+  `attacks/harder_scenario.py`): sender identity and value-change features,
+  scored across a separate-host and a spoofed-operator origin.
 - `detectors/evaluate.py` - runs all four over the same test set and reports
   precision/recall/F1/FPR, mean detection latency, and detector processing
   cost (per-request time + memory). Training and detection memory are
@@ -176,3 +205,15 @@ catching every replay and all injections but one, at ~0.03 ms per request with
 a 10 KB model and 14 ms of training. Caveats (see `docs/SETUP_LOG.md`): some
 injections are caught by timing alone, the replay signal depends on reused
 transaction IDs, and the tuning and test sessions share one attack sequence.
+
+Those three caveats are the subject of second-half item 5 (varied and harder
+attacks; `docs/EVALUATION_PROTOCOL.md` sections 5-6). In short: against attacks
+that vary every session the one-class SVM's score still separates attacks
+perfectly (ROC AUC / PR AUC 1.000), and a label-free threshold set from
+normal-only traffic reaches F1 0.993 with no attack labels to overfit. Against
+attacks built to erase the timing and transaction-ID signals, a sender-identity
+rule recovers detection of a separate-host attacker and value-change features
+recover the rewritten replay even from the operator's own address; a
+timing-mimicking in-band injection sent from the operator's address is the
+residual case that needs Modbus/TCP authentication, and is reported as such
+rather than hidden.

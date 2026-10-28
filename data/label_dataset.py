@@ -19,7 +19,11 @@ How each frame is labeled:
     bytes, to the per-packet log the attack script wrote (in the manifest).
     A logged "attack" packet takes the attack's label; the replay's "seed"
     packet (its stand-in for the recorded operator command, which is not
-    itself a replay) is labeled "replay_seed" and left unscored.
+    itself a replay) is labeled "replay_seed" and left unscored. A logged
+    "cover" packet (a harder attack's imitation of the operator's routine
+    level poll, sent only to blend in) is labeled "cover" and left unscored
+    too: it changes nothing in the process, so it is neither a hit nor a
+    false alarm.
   * Cross-checks, reported rather than silently trusted: every logged packet
     must match exactly one captured request, and every attack request must
     fall inside its attack's recorded wall-clock window. If any check fails
@@ -42,7 +46,8 @@ CAPTURE_CSV = DATA_DIR / "capture.csv"
 MANIFEST = DATA_DIR / "attack_manifest.json"
 LABELED_CSV = DATA_DIR / "labeled.csv"
 
-LABELS = ("benign", "replay", "injection", "replay_seed", "response", "unknown", "unmatched")
+LABELS = ("benign", "replay", "injection", "replay_seed", "cover", "response", "unknown",
+          "unmatched")
 ROLES = ("benign", "replay", "injection")
 
 
@@ -105,6 +110,8 @@ def main() -> None:
                     rec = queue.pop(0)
                     if rec["kind"] == "seed":
                         label, is_attack = "replay_seed", ""
+                    elif rec["kind"] == "cover":
+                        label, is_attack = "cover", ""
                     else:
                         label, is_attack = role, 1
                 else:
