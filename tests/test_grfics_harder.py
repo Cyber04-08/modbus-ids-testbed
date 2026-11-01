@@ -40,6 +40,25 @@ def test_rule_plant_still_flags_unused_register_and_reused_txid():
     assert ghe.rule_plant(df, None).tolist() == [1, 0, 1]
 
 
+def test_spoof_rewrites_only_the_attacker_ip():
+    df = pd.DataFrame({"src_ip": ["192.168.95.2", ATTACKER_IP, "192.168.90.5"],
+                       "label": ["benign", "injection", "benign"]})
+    out = ghe.spoof_src_ip(df)
+    assert out["src_ip"].tolist() == ["192.168.95.2", ghe.SPOOF_IP, "192.168.90.5"]
+    assert ghe.SPOOF_IP == "192.168.95.2"            # the PLC, a known writer
+    assert df["src_ip"].tolist()[1] == ATTACKER_IP   # original untouched
+    assert out["label"].tolist() == ["benign", "injection", "benign"]  # labels kept
+
+
+def test_spoofed_attacker_defeats_sender_identity():
+    # After the spoof, an in-band actuator write from the attacker carries the
+    # PLC's address, so rule-ident (known writers = the PLC) no longer flags it.
+    df = _df([(ATTACKER_IP, 16, 1, 9, 7, "b")])
+    assert ghe.rule_plant(df, {"192.168.95.2"}).tolist() == [1]      # separate host: flagged
+    df2 = _df([("192.168.95.2", 16, 1, 9, 7, "b")])                 # spoofed to PLC IP
+    assert ghe.rule_plant(df2, {"192.168.95.2"}).tolist() == [0]    # not flagged
+
+
 def test_label_session_uses_manifest_bytes(tmp_path, monkeypatch):
     csv = tmp_path / "attack_01.csv"
     csv.write_text("x\n")

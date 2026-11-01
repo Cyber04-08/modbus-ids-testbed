@@ -92,6 +92,22 @@ def label_session(csv_path: Path) -> pd.DataFrame:
     return df
 
 
+SPOOF_IP = "192.168.95.2"          # the PLC's own address (a known writer)
+
+
+def spoof_src_ip(df: pd.DataFrame) -> pd.DataFrame:
+    """Model a source-IP spoof: after labeling, the attacker's requests are
+    rewritten to carry the PLC's own address instead of the sensor's. Only
+    sender identity reads src_ip, so this is the one change a spoof makes to
+    the detectors' inputs; a live spoof capture is unreliable (the real PLC
+    owns that address on the segment), so it is modelled here. The attacker
+    keeps its own client ports, so the per-connection feature rows the SVM
+    uses, keyed on (src_ip, client_port), are unchanged apart from the IP tag."""
+    df = df.copy()
+    df.loc[df["src_ip"] == ATTACKER_IP, "src_ip"] = SPOOF_IP
+    return df
+
+
 def rule_plant(df: pd.DataFrame, known_writers: set | None) -> np.ndarray:
     """Plant-map rules (writes only to the actuator register; a reused txid
     with identical bytes is a replay), optionally with sender identity."""
@@ -179,26 +195,22 @@ def main() -> None:
           f"threshold from {len(val)} normal requests at {TARGET_FPR:.1%}; "
           f"known writers {sorted(dets.known_writers)}")
 
+    spoof = "--spoof" in sys.argv
     summary = []
     for prefix, desc in GROUPS.items():
         sessions = sorted(HARDER.glob(f"{prefix}_*.csv"))
         if not sessions:
             continue
-        rows = []
-        for f in sessions:
-            rows.extend(score_session(dets, label_session(f)))
-        group = summarize(rows)
-        print(f"\n{prefix}: {len(sessions)} sessions, {desc}")
-        print(f"  {'config':<12}{'replay pkt':>11}{'replay det':>11}{'inject pkt':>11}"
-              f"{'inject det':>11}{'FPR':>9}   FPR 95% CI")
-        for rec in group:
-            rec["group"] = prefix
-            summary.append(rec)
-            print(f"  {rec['config']:<12}{rec['packet_recall_replay']:>11.2f}"
-                  f"{rec['attack_detection_replay']:>11.2f}"
-                  f"{rec['packet_recall_injection']:>11.2f}{rec['attack_detection_injection']:>11.2f}"
-                  f"{rec['fpr']:>9.4f}   [{rec['fpr_lo']:.4f}, {rec['fpr_hi']:.4f}]")
-        print(f"  ({group[0]['n_replay']} replay and {group[0]['n_injection']} injection requests)")
+        for src, tag in ((False, prefix), (True, f"{prefix}-spoof")) if spoof else ((False, prefix),):
+            rows = []
+            for f in sessions:
+                df = label_session(f)
+                if src:
+                    df = spoof_src_ip(df)
+                rows.extend(score_session(dets, df))
+            group = summarize(rows)
+            note = desc + ("; attacker spoofs the PLC's source IP" if src else "")
+            _emit(summary, group, tag, len(sessions), note)
     print("\n'pkt' = share of requests flagged; 'det' = share of sessions with at least one flagged.")
 
     out = HARDER / "grfics_harder_summary.csv"
@@ -207,6 +219,20 @@ def main() -> None:
         w.writeheader()
         w.writerows(summary)
     print(f"summary -> {out}")
+
+
+def _emit(summary, group, tag, n_sessions, desc) -> None:
+    print(f"\n{tag}: {n_sessions} sessions, {desc}")
+    print(f"  {'config':<12}{'replay pkt':>11}{'replay det':>11}{'inject pkt':>11}"
+          f"{'inject det':>11}{'FPR':>9}   FPR 95% CI")
+    for rec in group:
+        rec["group"] = tag
+        summary.append(rec)
+        print(f"  {rec['config']:<12}{rec['packet_recall_replay']:>11.2f}"
+              f"{rec['attack_detection_replay']:>11.2f}"
+              f"{rec['packet_recall_injection']:>11.2f}{rec['attack_detection_injection']:>11.2f}"
+              f"{rec['fpr']:>9.4f}   [{rec['fpr_lo']:.4f}, {rec['fpr_hi']:.4f}]")
+    print(f"  ({group[0]['n_replay']} replay and {group[0]['n_injection']} injection requests)")
 
 
 if __name__ == "__main__":

@@ -262,6 +262,51 @@ Findings:
   (median run 17, max 1,473 in training), so a repeated write is normal here.
 - The SVM's realised false-alarm rate (0.6-1.0 %) is above the 0.5 % target
   from the validation session: plant traffic drifts between sessions.
-- Spoofing the PLC's own address was not run (the real PLC owns it on the
-  segment); by the testbed result (Section 6) sender identity would fail there,
-  leaving authentication (Section 7) as the only control.
+
+### 8.1 Spoofed source IP (`grfics_harder_eval.py --spoof`)
+
+A live spoof capture is unreliable (the real PLC owns 192.168.95.2 on the
+segment), so it is modelled in the pipeline: after labeling, the attacker's
+captured requests are rewritten to carry the PLC's address. Only sender
+identity reads `src_ip`, so this is the one input a spoof changes; the SVM's
+per-connection features (keyed on `(src_ip, client_port)`, attacker ports
+unchanged) are identical to Section 8's.
+
+| Detector | Replay (0.3 s) | Replay (paced) | Injection |
+|---|---|---|---|
+| rule-ident, separate host | 100 % | 100 % | 100 % |
+| rule-ident, spoofed PLC IP | 0 % | 0 % | 0 % |
+| ocsvm-both (unchanged either way) | 100 % | 0 % | 0 % |
+
+Spoofed to the PLC's address, sender identity degrades to the plain plant
+rules and catches nothing; the OC-SVM is unchanged. So the paced replay and
+the timing-mimic injection, sent from the PLC's own address, are caught by no
+passive method here, matching the testbed boundary (Section 6). The control
+that still holds is authentication (Section 7): its tag is a secret, not an
+address, so the `rewrite` and `resend` capabilities are blocked regardless of
+the claimed source IP.
+
+### 8.2 Off-the-shelf NIDS on the harder attacks (`tools/nids/run_nids_harder.sh`)
+
+Suricata (ET Open + Modbus anomaly rules) and Zeek were run over the 20 harder
+pcaps on the sensor, as in the Section 4 comparison but on plant traffic. No
+off-the-shelf configuration flags the harder attacks; the alert counts do not
+separate attack sessions from the attack-free validation session.
+
+- **Suricata, stock:** the only Modbus signature that fires is "Modbus Data
+  mismatch", 917 times on the attack-free `normal_val` and ~130 per attack
+  session: it fires on valid FC responses, not on the attacks, and is higher on
+  the traffic with no attack in it. The other volume is capture-tap artifacts
+  ("TCPv4 invalid checksum", "Ethernet packet too small"; one session,
+  `attack_02`, had a 104k burst of the latter), not Modbus detections.
+- **Suricata, project rules** (`tools/nids/modbus_project.rules`, written for
+  the Python testbed): "function code not allowed (FC4)" fires ~134 per session
+  on the PLC's normal FC4 reads, and "pump setpoint out of range (>100)" on the
+  plant's 0-65535 actuator values - both false positives from applying the
+  testbed's register map to the plant, not detections of the attacks.
+- **Zeek, stock:** parses the Modbus traffic (4-5k `modbus.log` lines per
+  session) but raises no notice on a valid write.
+
+This matches Section 4: catching these attacks needs plant-aware, stateful
+logic (sender identity, per-connection replay/transaction state), not a stock
+signature set. Output in `data/grfics/harder/nids/` (gitignored).
