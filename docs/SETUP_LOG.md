@@ -906,3 +906,20 @@ authorization) exists to close, and it is stated rather than hidden.
 
 Tests: `tests/test_generalization.py` and `tests/test_harder_attacks.py`
 (suite now 207, `python -m pytest tests`).
+
+## 2026-11-01 - Authentication stand-in; harder attacks on GRFICSv2
+
+- `testbed/secure_modbus.py` + `detectors/auth_eval.py`: counter + HMAC envelope
+  and gateway; results in EVALUATION_PROTOCOL.md section 7.
+- GRFICSv2 harder attacks (section 8): `tools/grfics_harder_attack.py`,
+  `tools/grfics_harder_capture.sh` (run as root on `ids-sensor`; the kali user's
+  sudo needs a password, so `echo kali | sudo -S bash ...`),
+  `detectors/grfics_harder_eval.py --convert`. Data in `data/grfics/harder/`
+  (gitignored).
+- Driving the sensor from Git Bash: `MSYS_NO_PATHCONV=1` (otherwise `/bin/bash`
+  becomes a Windows path), and `VBoxManage guestcontrol ... --exe /bin/bash -- -c "..."`
+  (the arguments after `--` start at argv[1]).
+- Pitfall: an edit to the capture script silently failed, a stale run overwrote
+  sessions 01-02 and was killed mid-capture (one 0-byte pcap). All 10 sessions
+  were then recaptured in one clean pass; check edits applied before starting
+  a long capture.

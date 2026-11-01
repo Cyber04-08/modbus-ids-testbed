@@ -227,3 +227,41 @@ boundary: with a stolen key authentication is blind (a detector still has a
 chance there), so the two are complementary. Key distribution, rotation and a
 constrained-device budget are out of scope. Outputs: `data/auth_results.csv`,
 `data/auth_cost.csv` (gitignored).
+
+## 8. Harder attacks on the GRFICSv2 plant (`detectors/grfics_harder_eval.py`)
+
+Section 6 replicated on the real plant. `tools/grfics_harder_attack.py` runs
+from the sensor (192.168.95.50, a separate host) against remote-IO 192.168.95.11
+while the plant runs: a transaction-ID-rewriting replay (10 resends of one
+in-band FC16 write) and a timing-mimicking injection (cover FC4 reads every
+~50 ms like the PLC, 5 in-band FC16 writes 1-5 ms after a read, values in the
+PLC's 25th-75th percentile). Two replay pacings: `attack_NN` resends every
+0.3 s; `paced_NN` copies the PLC's rhythm (read, then write 1-5 ms later, every
+~50 ms). Labels from a per-session manifest of exact bytes; cover reads and the
+seed are unscored. Train `data/grfics/normal_train.csv` (35,520 requests);
+label-free threshold at 0.5 % on a fresh 3-minute normal session
+(`harder/normal_val.csv`, 33,706 requests). 10 sessions per pacing, 100 replay
+and 50 injection requests each.
+
+| Detector | Replay (0.3 s) | Replay (paced) | Injection | FPR |
+|---|---|---|---|---|
+| rule-plant (unused register, reused txid) | 0 % | 0 % | 0 % | 0 % |
+| rule-ident (+ unknown writer) | 100 % | 100 % | 100 % | 0 % |
+| ocsvm-base | 100 % | 0 % | 0 % | 0.6-1.0 % |
+| ocsvm-ctx (+ repeat_run, write_step) | 2 % | 0 % | 0 % | 0.1 % |
+| ocsvm-both | 100 % | 0 % | 0 % | 0.6-1.0 % |
+
+(Packet recall; whole-attack detection is the same except ocsvm-ctx 0.3 s
+replay, 2 of 10 sessions.)
+
+Findings:
+- On the plant only sender identity survives. The one-class SVM's replay catch
+  was on timing: paced to the PLC's rhythm, the same replay is missed entirely.
+- The value-change features that recovered the rewritten replay on the water
+  tank do not transfer: the PLC writes the same value many times in a row
+  (median run 17, max 1,473 in training), so a repeated write is normal here.
+- The SVM's realised false-alarm rate (0.6-1.0 %) is above the 0.5 % target
+  from the validation session: plant traffic drifts between sessions.
+- Spoofing the PLC's own address was not run (the real PLC owns it on the
+  segment); by the testbed result (Section 6) sender identity would fail there,
+  leaving authentication (Section 7) as the only control.
