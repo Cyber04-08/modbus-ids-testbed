@@ -126,6 +126,21 @@ def best_f1_threshold(detector, tune_df) -> float:
     return best[1]
 
 
+def normal_quantile_threshold(detector, normal_df, target_fpr: float = 0.005) -> float:
+    """A label-free alert threshold: the lowest score at which at most
+    target_fpr of a separate NORMAL-ONLY session would alert. No attack
+    labels are used, so the threshold cannot be fitted to a particular
+    attack sequence (unlike best_f1_threshold). Ties can only make the
+    realized rate lower, never higher."""
+    if not 0 <= target_fpr < 1:
+        raise ValueError(f"target_fpr must be in [0, 1), got {target_fpr}")
+    scores = np.sort(detector.score(normal_training_rows(normal_df)))
+    allowed = int(np.floor(target_fpr * len(scores)))
+    # Strictly above the highest score that must stay quiet, so that only the
+    # `allowed` highest scores (or fewer, with ties) are >= the threshold.
+    return float(np.nextafter(scores[len(scores) - allowed - 1], np.inf))
+
+
 class MLAnomalyDetector:
     def __init__(self, contamination: float = DEFAULT_CONTAMINATION,
                  random_state: int = RANDOM_STATE, fill_first_gap: bool = False):
@@ -167,6 +182,12 @@ class MLAnomalyDetector:
         labeled TUNING session. Only that session's labels are used; test
         labels never are."""
         self.threshold_ = best_f1_threshold(self, tune_df)
+        return self
+
+    def calibrate_normal(self, normal_df, target_fpr: float = 0.005) -> "MLAnomalyDetector":
+        """Label-free alternative: threshold at target_fpr on a separate
+        normal-only session (normal_quantile_threshold)."""
+        self.threshold_ = normal_quantile_threshold(self, normal_df, target_fpr)
         return self
 
     def predict(self, df) -> np.ndarray:

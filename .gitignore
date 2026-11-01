@@ -21,3 +21,5 @@ data/v4_oct15_recovered/
 data/v4_oct16_overwrite/
 data/v5_before_bugfixes/
 .pytest_cache/
+data/varied/
+data/harder/

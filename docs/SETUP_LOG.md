@@ -844,3 +844,82 @@ New numbers from the added statistics (10 runs, pooled): OC-SVM FPR 0/610,
 Wilson 95% interval 0-0.006; recall 130/140 (0.874-0.961); per attack type,
 replay 80/80 and injection 50/60 (the one miss per run is the FC5 coil-OFF
 injection). Rule-based: replay 80/80, injection 20/60.
+
+## Second-half item 5: varied and harder attacks (2026-10-28)
+
+The last three limitations of the item-2 one-class SVM result were that some
+injections were caught by timing alone, the replay signal depended on a reused
+transaction ID, and the tuning and test sessions shared one attack sequence.
+Addressed in order; full methodology in `docs/EVALUATION_PROTOCOL.md` 5-6.
+
+**Varied attacks (limitation: shared attack sequence).** `run_scenario.py
+--vary [--seed N]` randomizes per session the attack order, the baseline
+padding, and each attack's frames/counts/timing (recorded in the manifest;
+without `--vary` the original bytes are sent, so earlier results reproduce).
+`detectors/generalization.py` scores 10 varied runs under three thresholding
+rules and reports ROC/PR AUC and leave-one-attack-type-out.
+
+Finding: the OC-SVM's separation is intact on varied attacks (ROC AUC and PR
+AUC 1.000), so its power was not an artifact of a repeated attack. What
+overfit was the best-F1 threshold. A label-free threshold
+(`ml_anomaly.normal_quantile_threshold`: the score above which <=0.5% of a
+normal-only session alerts, no attack labels) gives OC-SVM F1 0.993, recall
+1.000, FPR 0.4% on varied attacks, and on the fixed runs it also catches the
+FC5 coil-OFF injection the best-F1 setup always missed. The Isolation Forest's
+earlier numbers were optimistic (varied F1 ~0.58; recall 0 under the label-free
+threshold). Label-free is adopted as the OC-SVM's reported selection method.
+
+**Harder attacks (limitations: timing-only, reused txid).** Two attacks, each
+operator-paced so timing no longer separates them: `txid_replay.py` resends one
+captured command with fresh incrementing transaction IDs; `mimic_injection.py`
+injects in-band writes 1-5 ms after its own cover polls. Run from two origins
+by `harder_scenario.py`: a separate host (127.0.0.66) and the operator's own
+address (spoof, 127.0.0.1). Countermeasures, both off by default: a sender-
+identity rule (`unknown_source`) and value-change features (`repeat_run`,
+`write_step`) added to the OC-SVM as a context feature set. Scored once by
+`detectors/harder_attacks.py` (10 sessions/origin, whole-attack detection =
+at least one packet of that attack flagged):
+
+| config | sep. replay det | sep. inject det | spoof replay det | spoof inject det | FPR |
+|---|---|---|---|---|---|
+| rule-base | 0.00 | 0.00 | 0.00 | 0.00 | 0.000 |
+| rule-ident | 1.00 | 1.00 | 0.00 | 0.00 | 0.000 |
+| ocsvm-base | 0.00 | 0.00 | 0.00 | 0.00 | <=0.002 |
+| ocsvm-ctx | 1.00 | 0.00 | 0.90 | 0.00 | <=0.003 |
+| ocsvm-both | 1.00 | 0.00 | 0.90 | 0.00 | <=0.004 |
+
+Regression check on the saved varied runs (the value-change features must not
+weaken item 5's varied result): ocsvm-base recall 1.000 / FPR 0.004;
+ocsvm-ctx recall 0.520 / FPR 0.005 (the two extra columns move the label-free
+threshold, so the context set alone is worse on the earlier attacks);
+ocsvm-both (alert if either feature view fires) recall 1.000 / FPR 0.009. The
+context set is therefore reported as a complement, combined with the base set,
+not as a replacement.
+
+Honest boundary: the sender-identity rule recovers a separate-host attacker
+fully but is defeated by a spoofed/co-located one; value-change features
+recover the rewritten replay from either origin (it cannot hide a repeated
+command); but a timing-mimicking, in-band injection sent from the operator's
+own address is caught by no passive content/behaviour method here. That is the
+case Modbus/TCP authentication (Modbus/TCP Security, TLS with role-based
+authorization) exists to close, and it is stated rather than hidden.
+
+Tests: `tests/test_generalization.py` and `tests/test_harder_attacks.py`
+(suite now 207, `python -m pytest tests`).
+
+## 2026-11-01 - Authentication stand-in; harder attacks on GRFICSv2
+
+- `testbed/secure_modbus.py` + `detectors/auth_eval.py`: counter + HMAC envelope
+  and gateway; results in EVALUATION_PROTOCOL.md section 7.
+- GRFICSv2 harder attacks (section 8): `tools/grfics_harder_attack.py`,
+  `tools/grfics_harder_capture.sh` (run as root on `ids-sensor`; the kali user's
+  sudo needs a password, so `echo kali | sudo -S bash ...`),
+  `detectors/grfics_harder_eval.py --convert`. Data in `data/grfics/harder/`
+  (gitignored).
+- Driving the sensor from Git Bash: `MSYS_NO_PATHCONV=1` (otherwise `/bin/bash`
+  becomes a Windows path), and `VBoxManage guestcontrol ... --exe /bin/bash -- -c "..."`
+  (the arguments after `--` start at argv[1]).
+- Pitfall: an edit to the capture script silently failed, a stale run overwrote
+  sessions 01-02 and was killed mid-capture (one 0-byte pcap). All 10 sessions
+  were then recaptured in one clean pass; check edits applied before starting
+  a long capture.

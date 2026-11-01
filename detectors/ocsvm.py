@@ -32,6 +32,12 @@ labeled tuning session (calibrate()), so `nu` barely matters (0.01, 0.05 and
 inter-arrival (a placeholder 0) is replaced by the median training gap, as in
 the tuned forest.
 
+Context variant (OneClassSVMDetector(columns=OCSVM_CONTEXT_FEATURE_COLUMNS),
+the "ocsvm-ctx" detector of detectors/harder_attacks.py): adds the
+value-change features repeat_run and write_step (see features.py), aimed at a
+replay whose transaction IDs are rewritten. Each target's first write has no
+previous value; its write_step is filled with the median training step.
+
 Usage (normally driven by detectors/evaluate.py):
     python detectors/ocsvm.py [train_csv] [test_csv] [tune_csv]
 """
@@ -49,29 +55,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from features import (OCSVM_FEATURE_COLUMNS, build_feature_matrix,  # noqa: E402
                       load_requests)
 from ml_anomaly import (best_f1_threshold, median_real_gap,          # noqa: E402
-                        normal_training_rows)
+                        normal_quantile_threshold, normal_training_rows)
 
 DEFAULT_NU = 0.05
 
 
 class OneClassSVMDetector:
-    def __init__(self, nu: float = DEFAULT_NU):
+    def __init__(self, nu: float = DEFAULT_NU, columns=None):
         self.nu = nu
+        self.columns = list(columns or OCSVM_FEATURE_COLUMNS)
         self.gap_fill_ = 0.0
+        self.step_fill_ = 0.0
         self.threshold_ = None     # set by calibrate(); None = use nu boundary
         self.scaler = StandardScaler()
         self.model = OneClassSVM(kernel="rbf", gamma="scale", nu=nu)
 
     def _features(self, df) -> np.ndarray:
-        X = build_feature_matrix(df, OCSVM_FEATURE_COLUMNS)
-        col = OCSVM_FEATURE_COLUMNS.index("inter_arrival")
+        X = build_feature_matrix(df, self.columns)
+        col = self.columns.index("inter_arrival")
         X[df["first_on_connection"].to_numpy(), col] = self.gap_fill_
+        if "write_step" in self.columns:
+            col = self.columns.index("write_step")
+            X[np.isnan(X[:, col]), col] = self.step_fill_
         return X
 
     def fit(self, benign_df) -> "OneClassSVMDetector":
         """Fit on benign-only traffic (attack rows, if any, are dropped)."""
         benign_df = normal_training_rows(benign_df)
         self.gap_fill_ = median_real_gap(benign_df)
+        if "write_step" in self.columns:
+            steps = benign_df["write_step"]
+            steps = steps[(benign_df["repeat_run"] > 0) & steps.notna()]
+            self.step_fill_ = float(steps.median()) if len(steps) else 0.0
         self.model.fit(self.scaler.fit_transform(self._features(benign_df)))
         return self
 
@@ -82,6 +97,12 @@ class OneClassSVMDetector:
     def calibrate(self, tune_df) -> "OneClassSVMDetector":
         """Alert threshold = best F1 on the labeled tuning session."""
         self.threshold_ = best_f1_threshold(self, tune_df)
+        return self
+
+    def calibrate_normal(self, normal_df, target_fpr: float = 0.005) -> "OneClassSVMDetector":
+        """Label-free alternative: threshold at target_fpr on a separate
+        normal-only session (normal_quantile_threshold)."""
+        self.threshold_ = normal_quantile_threshold(self, normal_df, target_fpr)
         return self
 
     def predict(self, df) -> np.ndarray:

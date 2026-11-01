@@ -123,3 +123,190 @@ plant would need to dedicate to running it. They are not, and are not claimed
 to be, a measurement of control-loop delay. The passive tap is test
 instrumentation for capturing traffic on one machine, not part of either
 detector.
+
+## 5. Generalization check (does a detector work when the attack changes?)
+
+Section 3's limitation - every tuning and test session ran the same attack
+script - means a threshold tuned at best F1 on the tuning session may have
+been fitted to the one attack sequence it is later tested on. Three steps
+measure this (`detectors/generalization.py`):
+
+1. **Varied attacks.** `attacks/run_scenario.py --vary [--seed N]` draws, per
+   session, the attack order, the baseline padding, and a seed for each attack
+   script; the scripts then draw their own frames, counts and timing (replay:
+   which write is replayed, how many copies, 0.3-1.5 s apart; injection: 3-8
+   commands from the same kinds plus an in-band setpoint the fixed sequence
+   never sent). Every drawn value is recorded in the run's manifest, so a
+   varied session reproduces exactly. Without `--vary` the scripts send the
+   original bytes, so the Section 3 results still reproduce.
+2. **Three ways to set the ML alert threshold**, compared on the same runs:
+   tuned at best F1 on the fixed tuning session (the Section 3 protocol);
+   tuned on a separate varied session; and **label-free** - the score above
+   which at most 0.5 % of a separate normal-only session alerts, using no
+   attack labels at all (`ml_anomaly.normal_quantile_threshold`).
+3. **Leave-one-attack-type-out** and **threshold-free** quality: tune on one
+   attack type and grade on the other; and ROC AUC / PR AUC of each ML score,
+   so a result does not hinge on one threshold.
+
+Headline finding (10 varied runs, train 90 benign): the one-class SVM's
+separation is intact (ROC AUC and PR AUC 1.000 on varied as on fixed attacks),
+so its detection power was not an artifact of a repeated attack. What was
+fragile is threshold selection: a best-F1 threshold overfits the tuning
+attack, while the **label-free threshold gives F1 0.993 (recall 1.000, FPR
+0.4 %)** on varied attacks with no labels to overfit. The Isolation Forest's
+earlier numbers were optimistic (varied F1 ~0.58; recall 0 under the
+label-free threshold). The label-free threshold is therefore adopted as the
+one-class SVM's reported selection method.
+
+## 6. Harder attacks and countermeasures (limitations 1 and 2)
+
+Two attacks are built to defeat the signals the detectors relied on, run from
+two attacker origins, and scored once as a final test
+(`attacks/harder_scenario.py`, `detectors/harder_attacks.py`):
+
+| Attack | Defeats | How |
+|---|---|---|
+| `txid_replay.py` | reused-transaction-ID signal (rule `replay_reused_txid`, feature `txid_delta`) | resends one captured command with fresh, incrementing transaction IDs, paced like the operator (cover polls + write 1-5 ms later) |
+| `mimic_injection.py` | timing separation and value-range checks | injects in-band writes (setpoint 20-90 %, valves ON/OFF) 1-5 ms after its own cover polls |
+
+| Origin | Attacker source IP | Meaning |
+|---|---|---|
+| `separate` | 127.0.0.66 | a distinct host on the ICS LAN |
+| `spoof` | 127.0.0.1 | the operator's own address (co-located or spoofed) |
+
+Countermeasures added (off by default, so Sections 3 and 5 are unchanged):
+
+- **Sender identity** (rule `unknown_source`): flag a write from a host that
+  sent no traffic in the normal training session. `RuleBasedDetector(
+  known_sources=...)`.
+- **Value-change features** `repeat_run` (identical writes in a row to one
+  target) and `write_step` (step from the last value written), added to the
+  one-class SVM as `OCSVM_CONTEXT_FEATURE_COLUMNS` ("ocsvm-ctx"). A replay that
+  rewrites its transaction IDs still repeats the same command, which
+  `repeat_run` sees.
+
+Cover polls carry the label `cover` and are left unscored (they change nothing
+in the process). Results and the regression check (that the value-change
+features do not weaken the Section 5 varied-run result) are written to
+`data/harder/`. The honest boundary this exposes: a timing-mimicking, in-band
+injection sent from the operator's own address is not caught by any passive
+content/behaviour method here - only sender identity catches it, and only when
+the attacker is on a different host. That is the case Modbus/TCP authentication
+(Modbus/TCP Security, TLS with role-based authorization) exists to close, and
+it is stated as such rather than papered over.
+
+## 7. Authentication as the closing control (`testbed/secure_modbus.py`)
+
+Section 6 ends on a case no passive method here catches. This section measures
+the control that does. `secure_modbus.py` wraps each request in an envelope
+(8-byte counter, the frame, a 16-byte HMAC-SHA256 tag over both); a gateway
+accepts it only if the tag verifies and the counter is higher than any accepted
+before. It stands in for Modbus/TCP Security (TLS); it reproduces integrity and
+anti-replay, not confidentiality or certificates, so its cost is a lower bound.
+
+`detectors/auth_eval.py` pushes the saved harder and varied sessions through
+the gateway (operator sealed in order; attacker per capability):
+
+| Attacker capability | Replay blocked | Injection blocked | Operator wrongly blocked |
+|---|---|---|---|
+| no key (made-up tag) | 100 % | 100 % | 0 % |
+| resends a sniffed envelope | 100 % | 100 % | 0 % |
+| reuses a sniffed tag on a changed frame (rewritten txid/value) | 100 % | 100 % | 0 % |
+| holds the key | 0 % | 0 % | 0 % |
+
+(Same result on `harder/separate`, `harder/spoof` and `varied`; 10 sessions
+each; the mimic injection from the operator's own address is blocked too,
+because the check is on a secret, not on timing, values or address.)
+Cost: about 4 us to seal and 4 us to verify per request (rule-based detector
+0.0027 ms, one-class SVM 0.034 ms), plus 24 bytes on a 12-byte frame.
+
+What this does and does not show: it is a protocol property demonstrated on
+the project's traffic, not a discovery; the keyless result is expected by
+construction. The useful findings are the cost beside the detectors and the
+boundary: with a stolen key authentication is blind (a detector still has a
+chance there), so the two are complementary. Key distribution, rotation and a
+constrained-device budget are out of scope. Outputs: `data/auth_results.csv`,
+`data/auth_cost.csv` (gitignored).
+
+## 8. Harder attacks on the GRFICSv2 plant (`detectors/grfics_harder_eval.py`)
+
+Section 6 replicated on the real plant. `tools/grfics_harder_attack.py` runs
+from the sensor (192.168.95.50, a separate host) against remote-IO 192.168.95.11
+while the plant runs: a transaction-ID-rewriting replay (10 resends of one
+in-band FC16 write) and a timing-mimicking injection (cover FC4 reads every
+~50 ms like the PLC, 5 in-band FC16 writes 1-5 ms after a read, values in the
+PLC's 25th-75th percentile). Two replay pacings: `attack_NN` resends every
+0.3 s; `paced_NN` copies the PLC's rhythm (read, then write 1-5 ms later, every
+~50 ms). Labels from a per-session manifest of exact bytes; cover reads and the
+seed are unscored. Train `data/grfics/normal_train.csv` (35,520 requests);
+label-free threshold at 0.5 % on a fresh 3-minute normal session
+(`harder/normal_val.csv`, 33,706 requests). 10 sessions per pacing, 100 replay
+and 50 injection requests each.
+
+| Detector | Replay (0.3 s) | Replay (paced) | Injection | FPR |
+|---|---|---|---|---|
+| rule-plant (unused register, reused txid) | 0 % | 0 % | 0 % | 0 % |
+| rule-ident (+ unknown writer) | 100 % | 100 % | 100 % | 0 % |
+| ocsvm-base | 100 % | 0 % | 0 % | 0.6-1.0 % |
+| ocsvm-ctx (+ repeat_run, write_step) | 2 % | 0 % | 0 % | 0.1 % |
+| ocsvm-both | 100 % | 0 % | 0 % | 0.6-1.0 % |
+
+(Packet recall; whole-attack detection is the same except ocsvm-ctx 0.3 s
+replay, 2 of 10 sessions.)
+
+Findings:
+- On the plant only sender identity survives. The one-class SVM's replay catch
+  was on timing: paced to the PLC's rhythm, the same replay is missed entirely.
+- The value-change features that recovered the rewritten replay on the water
+  tank do not transfer: the PLC writes the same value many times in a row
+  (median run 17, max 1,473 in training), so a repeated write is normal here.
+- The SVM's realised false-alarm rate (0.6-1.0 %) is above the 0.5 % target
+  from the validation session: plant traffic drifts between sessions.
+
+### 8.1 Spoofed source IP (`grfics_harder_eval.py --spoof`)
+
+A live spoof capture is unreliable (the real PLC owns 192.168.95.2 on the
+segment), so it is modelled in the pipeline: after labeling, the attacker's
+captured requests are rewritten to carry the PLC's address. Only sender
+identity reads `src_ip`, so this is the one input a spoof changes; the SVM's
+per-connection features (keyed on `(src_ip, client_port)`, attacker ports
+unchanged) are identical to Section 8's.
+
+| Detector | Replay (0.3 s) | Replay (paced) | Injection |
+|---|---|---|---|
+| rule-ident, separate host | 100 % | 100 % | 100 % |
+| rule-ident, spoofed PLC IP | 0 % | 0 % | 0 % |
+| ocsvm-both (unchanged either way) | 100 % | 0 % | 0 % |
+
+Spoofed to the PLC's address, sender identity degrades to the plain plant
+rules and catches nothing; the OC-SVM is unchanged. So the paced replay and
+the timing-mimic injection, sent from the PLC's own address, are caught by no
+passive method here, matching the testbed boundary (Section 6). The control
+that still holds is authentication (Section 7): its tag is a secret, not an
+address, so the `rewrite` and `resend` capabilities are blocked regardless of
+the claimed source IP.
+
+### 8.2 Off-the-shelf NIDS on the harder attacks (`tools/nids/run_nids_harder.sh`)
+
+Suricata (ET Open + Modbus anomaly rules) and Zeek were run over the 20 harder
+pcaps on the sensor, as in the Section 4 comparison but on plant traffic. No
+off-the-shelf configuration flags the harder attacks; the alert counts do not
+separate attack sessions from the attack-free validation session.
+
+- **Suricata, stock:** the only Modbus signature that fires is "Modbus Data
+  mismatch", 917 times on the attack-free `normal_val` and ~130 per attack
+  session: it fires on valid FC responses, not on the attacks, and is higher on
+  the traffic with no attack in it. The other volume is capture-tap artifacts
+  ("TCPv4 invalid checksum", "Ethernet packet too small"; one session,
+  `attack_02`, had a 104k burst of the latter), not Modbus detections.
+- **Suricata, project rules** (`tools/nids/modbus_project.rules`, written for
+  the Python testbed): "function code not allowed (FC4)" fires ~134 per session
+  on the PLC's normal FC4 reads, and "pump setpoint out of range (>100)" on the
+  plant's 0-65535 actuator values - both false positives from applying the
+  testbed's register map to the plant, not detections of the attacks.
+- **Zeek, stock:** parses the Modbus traffic (4-5k `modbus.log` lines per
+  session) but raises no notice on a valid write.
+
+This matches Section 4: catching these attacks needs plant-aware, stateful
+logic (sender identity, per-connection replay/transaction state), not a stock
+signature set. Output in `data/grfics/harder/nids/` (gitignored).

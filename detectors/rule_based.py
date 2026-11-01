@@ -28,11 +28,19 @@ Invariants checked (each firing sets is_attack=1 and names the rule):
      repeated value) means a legitimate controller holding a setpoint steady -
      same value, fresh incrementing txids - is NOT flagged.
 
+  5. unknown_source            - (only with known_sources, the sender-identity
+     countermeasure of detectors/harder_attacks.py) a request from a host
+     that never sent traffic in the normal training session. Like the Wiley
+     frame-filter's source-IP allowlist.
+
 Note on source identity: the Wiley frame-filter also allowlists by source IP.
-On this single-host loopback testbed every client is 127.0.0.1, so source-IP
-allowlisting collapses and this detector relies on content/behaviour
-invariants instead; the GRFICSv2 VM testbed provides true per-host IPs when
-that rule is wanted. This is a documented limitation, not an oversight.
+On the original single-host loopback testbed every client is 127.0.0.1, so
+source-IP allowlisting collapses and this detector relies on content/behaviour
+invariants by default. The tap now logs each client's IP, and the harder
+attacks can come from a second loopback address standing in for a separate
+attacker host, which is what rule 5 is tested against. An attacker who sends
+from the operator's own address (spoofing it, or on the operator's machine)
+defeats rule 5; harder_attacks.py measures that case too.
 
 Usage:
     python detectors/rule_based.py [data/labeled.csv]   # score + print summary
@@ -70,9 +78,11 @@ COIL_VALUES = {0, 0xFF00}                   # Modbus OFF / ON encodings
 
 
 class RuleBasedDetector:
-    def __init__(self):
+    def __init__(self, known_sources=None):
         # Per-connection memory for the replay rule.
         self._seen_txid_payload: dict[str, dict[int, str]] = {}
+        # Hosts allowed to talk to the PLC (rule 5); None = rule off.
+        self.known_sources = None if known_sources is None else set(known_sources)
 
     def reset(self) -> None:
         self._seen_txid_payload.clear()
@@ -95,6 +105,10 @@ class RuleBasedDetector:
 
         if fc not in ALLOWED_FUNCTION_CODES:
             return 1, "function_code_not_allowed"
+
+        if (self.known_sources is not None
+                and str(getattr(row, "src_ip", "")) not in self.known_sources):
+            return 1, "unknown_source"
 
         if fc in WRITE_FUNCTION_CODES:
             # Address-range / read-only checks.
