@@ -194,3 +194,36 @@ content/behaviour method here - only sender identity catches it, and only when
 the attacker is on a different host. That is the case Modbus/TCP authentication
 (Modbus/TCP Security, TLS with role-based authorization) exists to close, and
 it is stated as such rather than papered over.
+
+## 7. Authentication as the closing control (`testbed/secure_modbus.py`)
+
+Section 6 ends on a case no passive method here catches. This section measures
+the control that does. `secure_modbus.py` wraps each request in an envelope
+(8-byte counter, the frame, a 16-byte HMAC-SHA256 tag over both); a gateway
+accepts it only if the tag verifies and the counter is higher than any accepted
+before. It stands in for Modbus/TCP Security (TLS); it reproduces integrity and
+anti-replay, not confidentiality or certificates, so its cost is a lower bound.
+
+`detectors/auth_eval.py` pushes the saved harder and varied sessions through
+the gateway (operator sealed in order; attacker per capability):
+
+| Attacker capability | Replay blocked | Injection blocked | Operator wrongly blocked |
+|---|---|---|---|
+| no key (made-up tag) | 100 % | 100 % | 0 % |
+| resends a sniffed envelope | 100 % | 100 % | 0 % |
+| reuses a sniffed tag on a changed frame (rewritten txid/value) | 100 % | 100 % | 0 % |
+| holds the key | 0 % | 0 % | 0 % |
+
+(Same result on `harder/separate`, `harder/spoof` and `varied`; 10 sessions
+each; the mimic injection from the operator's own address is blocked too,
+because the check is on a secret, not on timing, values or address.)
+Cost: about 4 us to seal and 4 us to verify per request (rule-based detector
+0.0027 ms, one-class SVM 0.034 ms), plus 24 bytes on a 12-byte frame.
+
+What this does and does not show: it is a protocol property demonstrated on
+the project's traffic, not a discovery; the keyless result is expected by
+construction. The useful findings are the cost beside the detectors and the
+boundary: with a stolen key authentication is blind (a detector still has a
+chance there), so the two are complementary. Key distribution, rotation and a
+constrained-device budget are out of scope. Outputs: `data/auth_results.csv`,
+`data/auth_cost.csv` (gitignored).
